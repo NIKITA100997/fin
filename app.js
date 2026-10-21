@@ -727,33 +727,48 @@ function eventInfo(e) {
   return { items, target, spent };
 }
 
-function fundingPlan(e, target) {
+/**
+ * Планы финансирования всех событий сразу, по порядку дат: более ранние события
+ * первыми забирают резерв; урезание удовольствий и отсрочка досрочки — не больше одного раза в месяц.
+ */
+function fundingPlans(list) {
   const bs = RAW.limits.length ? budgetState() : [];
-  const months = Math.max(0, (Number(e.date.slice(0, 4)) - Number(TODAY.slice(0, 4))) * 12 + Number(e.date.slice(5, 7)) - Number(TODAY.slice(5, 7)));
   const reserve = bs.filter(b => b.rollover === 'carry' && /резерв/i.test(b.name));
   const resNow = reserve.reduce((s, b) => s + Math.max(0, b.rem), 0);
   const resMonthly = reserve.reduce((s, b) => s + Number(b.limit_amount), 0);
-  const fromReserve = resNow + resMonthly * months;
   const wantHalf = bs.filter(b => b.grp === 'want').reduce((s, b) => s + Number(b.limit_amount), 0) / 2;
   const loan = STATE.loans[0];
-  const deferPrepay = 23520;
-  const deferCost = loan ? deferPrepay * E.loanRateAnnual(loan).rate / 12 : 0;
-  const rows = [
-    ['Резерв на нерегулярное к дате', fromReserve, 'бесплатно'],
-    ['Урезать удовольствия вдвое в месяц события', wantHalf, 'бесплатно'],
-    ['Отложить досрочку по кредиту на месяц', deferPrepay, `≈${E.rub(deferCost)} процентов`],
-  ];
-  let left = target;
-  const used = rows.map(([label, v, cost]) => { const take = Math.max(0, Math.min(v, left)); left -= take; return { label, take, cost }; }).filter(r => r.take > 0);
-  const sberDue = E.monthDay(e.date, 3, 31);
-  return { used, left, sberDue };
+  const DEFER = loan ? 23520 : 0;
+  const rateM = loan ? E.loanRateAnnual(loan).rate / 12 : 0;
+  const monthsTo = d => Math.max(0, (Number(d.slice(0, 4)) - Number(TODAY.slice(0, 4))) * 12 + Number(d.slice(5, 7)) - Number(TODAY.slice(5, 7)));
+  let resUsed = 0;
+  const wantLeft = new Map(), deferLeft = new Map();
+  const out = new Map();
+  for (const { e, need } of [...list].sort((a, b) => a.e.date.localeCompare(b.e.date))) {
+    const m = ym(e.date);
+    if (!wantLeft.has(m)) wantLeft.set(m, wantHalf);
+    if (!deferLeft.has(m)) deferLeft.set(m, DEFER);
+    const resAvail = Math.max(0, resNow + resMonthly * monthsTo(e.date) - resUsed);
+    let left = need;
+    const used = [];
+    const take = (label, avail, cost) => { const t = Math.max(0, Math.min(avail, left)); if (t > 0) { used.push({ label, take: t, cost: typeof cost === 'function' ? cost(t) : cost }); left -= t; } return t; };
+    resUsed += take('Резерв на нерегулярное к дате', resAvail, resUsed > 0 ? 'с учётом более ранних событий' : 'бесплатно');
+    wantLeft.set(m, wantLeft.get(m) - take('Урезать удовольствия вдвое в месяц события', wantLeft.get(m), 'бесплатно'));
+    deferLeft.set(m, deferLeft.get(m) - take('Отложить досрочку по кредиту на месяц', deferLeft.get(m), t => `≈${E.rub(t * rateM)} процентов`));
+    out.set(e.id, { used, left, sberDue: E.monthDay(e.date, 3, 31), shared: used.some(u => u.cost === 'с учётом более ранних событий') });
+  }
+  return out;
 }
 
 function eventsPanel() {
-  return `${RAW.events.filter(e => e.date >= E.addDays(TODAY, -14)).map(e => {
-    const { items, target, spent } = eventInfo(e);
-    const need = items.length ? items.filter(i => !i.bought).reduce((s, i) => s + Number(i.budget ?? 0), 0) : Math.max(0, target - spent);
-    const fp = fundingPlan(e, need);
+  const active = RAW.events.filter(e => e.date >= E.addDays(TODAY, -14)).map(e => {
+    const info = eventInfo(e);
+    const need = info.items.length ? info.items.filter(i => !i.bought).reduce((s, i) => s + Number(i.budget ?? 0), 0) : Math.max(0, info.target - info.spent);
+    return { e, ...info, need };
+  });
+  const plans = fundingPlans(active);
+  return `${active.map(({ e, items, target, spent, need }) => {
+    const fp = plans.get(e.id);
     const bought = items.filter(i => i.bought).length;
     return `<section class="panel">
       <div class="panel-head"><h2>${esc(e.name)}</h2><button class="btn link" data-event="${e.id}">Изменить</button></div>
