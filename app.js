@@ -92,10 +92,11 @@ async function load() {
     sb.from('categories').select('*').order('name'),
     sb.from('goals').select('*').order('created_at'),
     sb.from('wishlist_items').select('*').is('bought_at', null).order('priority'),
+    sb.from('recurring_incomes').select('*').eq('is_active', true).order('day_of_month'),
   ]);
   const err = all.find(r => r.error);
   if (err) throw err.error;
-  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist] = all.map(r => r.data);
+  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes] = all.map(r => r.data);
 
   const acc = new Map(accounts.map(a => [a.id, a]));
   const latest = new Map();
@@ -116,7 +117,7 @@ async function load() {
   }
   const bal = id => balance.get(id) ?? 0;
 
-  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist };
+  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes };
 
   STATE = {
     cards: terms.filter(t => acc.has(t.account_id)).map(t => {
@@ -160,6 +161,49 @@ async function load() {
 const moneyAccounts = () => RAW.accounts.filter(a => a.kind in MONEY_KINDS);
 const assetsTotal = () => moneyAccounts().reduce((s, a) => s + RAW.bal(a.id), 0);
 const debtsTotal = () => RAW.accounts.filter(a => DEBT_KINDS.has(a.kind)).reduce((s, a) => s + RAW.bal(a.id), 0);
+
+const liquidTotal = () => RAW.accounts.filter(a => a.kind === 'debit' || a.kind === 'cash').reduce((s, a) => s + RAW.bal(a.id), 0);
+
+/** Ожидаемые поступления: плановые даты, по которым ещё не записан факт (±7 дней). */
+function pendingIncomes(horizon = HORIZON) {
+  const from = E.addDays(TODAY, -10);
+  const out = [];
+  for (const inc of RAW.incomes) {
+    for (const date of E.incomeDates({ day: inc.day_of_month, shiftWeekend: inc.shift_weekend }, from, horizon)) {
+      const got = RAW.txs.some(t => t.recurring_income_id === inc.id && Math.abs(E.diffDays(t.occurred_at.slice(0, 10), date)) <= 7);
+      if (got) continue;
+      if (date < TODAY && E.diffDays(date, TODAY) > 7) continue;
+      out.push({ id: inc.id, date, amount: Number(inc.amount), name: inc.name, late: date < TODAY });
+    }
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** Прогноз свободных денег (карты и наличные) с учётом плановых доходов и платежей. */
+function forecast() {
+  let bal = liquidTotal();
+  const ev = [
+    ...pendingIncomes().map(i => ({ date: i.date < TODAY ? TODAY : i.date, delta: i.amount, inc: 1 })),
+    ...CAL.filter(o => o.counts && o.date >= TODAY).map(o => ({ date: o.date, delta: -o.amount, inc: 0 })),
+  ].sort((a, b) => a.date.localeCompare(b.date) || b.inc - a.inc);
+  let min = { value: bal, date: TODAY };
+  const byDate = new Map();
+  for (const e of ev) {
+    bal += e.delta;
+    byDate.set(e.date, bal);
+    if (bal < min.value) min = { value: bal, date: e.date };
+  }
+  return { min, end: bal, byDate, start: liquidTotal() };
+}
+
+const monthTotals = ym => {
+  let inc = 0, exp = 0;
+  for (const t of RAW.txs) {
+    if (t.link_id || t.occurred_at.slice(0, 7) !== ym) continue;
+    if (t.amount > 0) inc += Number(t.amount); else exp -= Number(t.amount);
+  }
+  return { inc, exp };
+};
 
 const staleNote = id => {
   const s = RAW.latest.get(id);
@@ -255,6 +299,9 @@ function viewOverview() {
   const max = Math.max(1, ...months.map(([, v]) => v));
   const assets = assetsTotal(), debts = debtsTotal();
   const funding = STATE.installments.filter(p => p.fundingAccount && p.nextDate && E.diffDays(TODAY, p.nextDate) <= 7);
+  const nextInc = RAW.incomes.length ? pendingIncomes()[0] : null;
+  const fc = RAW.incomes.length ? forecast() : null;
+  const gap = fc && fc.min.value < 0 ? fc.min : null;
 
   return `
     <div class="top"><h1>Обзор</h1><button class="icon-btn" id="logout">Выйти</button></div>
@@ -269,6 +316,7 @@ function viewOverview() {
         </div>
       </section>` : ''}
 
+      ${gap ? `<div class="notice">По плану к ${E.ru(gap.date)} на картах и наличными не хватит ≈ ${E.rub(-gap.value)}. Подробности в календаре.</div>` : ''}
       ${funding.map(p => `<div class="notice">До ${E.ru(p.nextDate)} пополните счёт «${esc(p.fundingAccount)}» на ${E.rub(p.nextAmount)}: ${esc(p.name)} списывается автоматически.</div>`).join('')}
 
       <section class="panel">
@@ -277,6 +325,7 @@ function viewOverview() {
           <div><span>Долги</span><b>${E.rub(debts)}</b></div>
           <div><span>Капитал</span><b class="${assets - debts < 0 ? 'neg' : ''}">${assets - debts < 0 ? '−' : ''}${E.rub(Math.abs(assets - debts))}</b></div>
         </div>
+        ${nextInc ? `<div class="item-note" style="margin-top:8px">Ближайшее поступление: ${esc(nextInc.name)}${nextInc.late ? ', ожидалось' : ''} ${E.ru(nextInc.date)}, +${E.rub(nextInc.amount)}</div>` : '<div class="item-note" style="margin-top:8px">Добавьте зарплату на вкладке «Деньги», и здесь появится прогноз.</div>'}
         <div class="btns">
           <button class="btn small" data-new-tx="expense">Расход</button>
           <button class="btn ghost small" data-new-tx="income">Доход</button>
@@ -308,6 +357,7 @@ function viewOverview() {
 // ---------------------------------------------------------------- Деньги
 function viewMoney() {
   const accs = moneyAccounts();
+  const mt = monthTotals(TODAY.slice(0, 7));
   return `
     <div class="top"><h1>Деньги</h1><button class="btn ghost small" data-new-acc>Новый счёт</button></div>
     <div class="stack">
@@ -321,6 +371,26 @@ function viewMoney() {
             <div class="item-amt">${E.rub(RAW.bal(a.id))}</div>
           </button>`).join('') || '<p class="muted small">Добавьте карты, наличные и накопления, чтобы видеть свои деньги и капитал.</p>'}
         ${accs.length ? `<div class="total"><span>Всего</span><span>${E.rub(assetsTotal())}</span></div>` : ''}
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Регулярные доходы</h2><button class="btn link" data-new-income>Добавить</button></div>
+        ${RAW.incomes.map(inc => {
+          const next = pendingIncomes().find(p => p.id === inc.id);
+          return `<button class="item item-btn" data-income="${inc.id}">
+            <div class="item-main"><div class="item-title">${esc(inc.name)}</div>
+              <div class="item-note">${inc.day_of_month === 31 ? 'в последний день месяца' : `${inc.day_of_month}-го числа`}${inc.shift_weekend ? ', с выходных — раньше' : ''}${next ? `; следующее ${E.ru(next.date)}` : ''}</div></div>
+            <div class="item-amt pos">+${E.rub(inc.amount)}</div></button>`;
+        }).join('') || '<p class="muted small">Зарплата, аванс, подработка: даты и суммы попадут в календарь и прогноз.</p>'}
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>${E.monthName(TODAY.slice(0, 7))}</h2><button class="btn link" data-export>Выгрузить</button></div>
+        <div class="kv">
+          <div><span>Доходы</span><b class="pos">+${E.rub(mt.inc)}</b></div>
+          <div><span>Расходы</span><b>−${E.rub(mt.exp)}</b></div>
+        </div>
+        <p class="muted small" style="margin:8px 0 0">Без переводов между своими счетами.</p>
       </section>
 
       <section class="panel">
@@ -467,23 +537,49 @@ function viewGoals() {
 }
 
 // ---------------------------------------------------------------- Календарь
+function incomeRow(i) {
+  return `<button class="item item-btn" data-receive="${i.id}" data-date="${i.date}">
+    <div class="item-left"><div class="date-col">${E.ru(i.date)}</div>
+      <div class="item-main"><div class="item-title">${esc(i.name)}</div>
+        <div class="item-note">${i.late ? 'ожидалось — нажмите, когда придёт' : 'нажмите, когда придёт'}</div></div></div>
+    <div class="item-amt pos">+${E.rub(i.amount)}</div></button>`;
+}
+
 function viewCalendar() {
+  const fc = RAW.incomes.length ? forecast() : null;
+  const rows = [
+    ...CAL.filter(o => o.date >= TODAY).map(o => ({ date: o.date, html: obligationRow(o), out: o.counts ? o.amount : 0, inc: 0 })),
+    ...pendingIncomes().map(i => ({ date: i.date < TODAY ? TODAY : i.date, html: incomeRow(i), out: 0, inc: i.amount })),
+  ].sort((a, b) => a.date.localeCompare(b.date) || b.inc - a.inc);
   const byMonth = new Map();
-  for (const o of CAL.filter(o => o.date >= TODAY)) {
-    const k = o.date.slice(0, 7);
+  for (const r of rows) {
+    const k = r.date.slice(0, 7);
     if (!byMonth.has(k)) byMonth.set(k, []);
-    byMonth.get(k).push(o);
+    byMonth.get(k).push(r);
   }
   return `
     <div class="top"><h1>Календарь</h1></div>
-    <p class="muted small" style="margin-top:-8px">≈ — прогноз, уточнится по выписке. В скобках — минимальные платежи, которые уже входят в другой платёж.</p>
+    ${fc ? `<section class="panel" style="margin-bottom:12px">
+      <div class="kv">
+        <div><span>На картах и наличными</span><b>${E.rub(fc.start)}</b></div>
+        <div><span>Минимум по плану</span><b class="${fc.min.value < 0 ? 'neg' : ''}">${fc.min.value < 0 ? '−' : ''}${E.rub(Math.abs(fc.min.value))}, ${E.ru(fc.min.date)}</b></div>
+      </div>
+      <p class="muted small" style="margin:8px 0 0">Если доходы придут по плану, а платежи пройдут в срок. Накопления и инвестиции не учитываются.</p>
+    </section>` : ''}
+    <p class="muted small" style="margin-top:0">≈ — прогноз, уточнится по выписке. В скобках — минимальные платежи, которые уже входят в другой платёж.</p>
     <div class="stack">
-      ${[...byMonth].map(([m, list]) => `
-        <section class="panel">
+      ${[...byMonth].map(([m, list]) => {
+        const out = list.reduce((s, r) => s + r.out, 0), inc = list.reduce((s, r) => s + r.inc, 0);
+        const lastDate = list[list.length - 1].date;
+        const left = fc ? [...fc.byDate].filter(([d]) => d <= lastDate).pop()?.[1] : null;
+        return `<section class="panel">
           <h2>${E.monthName(m)}</h2>
-          ${list.map(o => obligationRow(o)).join('')}
-          <div class="total"><span>За месяц</span><span>${E.rub(list.filter(o => o.counts).reduce((s, o) => s + o.amount, 0))}</span></div>
-        </section>`).join('')}
+          ${list.map(r => r.html).join('')}
+          <div class="total"><span>Платежи</span><span>${E.rub(out)}</span></div>
+          ${inc ? `<div class="row small" style="margin-top:6px"><span class="muted">Поступления</span><b class="pos">+${E.rub(inc)}</b></div>` : ''}
+          ${left != null ? `<div class="row small" style="margin-top:6px"><span class="muted">Останется к концу месяца</span><b class="${left < 0 ? 'neg' : ''}">${left < 0 ? '−' : ''}${E.rub(Math.abs(left))}</b></div>` : ''}
+        </section>`;
+      }).join('')}
     </div>`;
 }
 
@@ -501,7 +597,7 @@ async function categoryId(name) {
   return data.id;
 }
 
-async function newTx(kind, tx) {
+async function newTx(kind, tx, preset = {}) {
   const editing = !!tx;
   if (kind === 'transfer') {
     const v = await form({ title: 'Перевод', text: 'Между своими счетами: погашение кредитки, досрочка по кредиту, снятие наличных.', fields: [
@@ -522,12 +618,12 @@ async function newTx(kind, tx) {
   const v = await form({
     title: editing ? 'Операция' : income ? 'Доход' : 'Расход',
     fields: [
-      { name: 'amount', label: 'Сумма, ₽', value: editing ? Math.abs(tx.amount) : '' },
+      { name: 'amount', label: 'Сумма, ₽', value: editing ? Math.abs(tx.amount) : preset.amount ?? '' },
       { name: 'account', label: income ? 'На счёт' : 'Со счёта или карты', type: 'select',
         options: accountOptions(a => income ? a.kind in MONEY_KINDS : a.kind in MONEY_KINDS || a.kind === 'credit_card' || a.kind === 'installment'),
-        value: editing ? tx.account_id : (localStorage.getItem('lastAcc') || moneyAccounts()[0]?.id) },
+        value: editing ? tx.account_id : (preset.account || localStorage.getItem('lastAcc') || moneyAccounts()[0]?.id) },
       { name: 'category', label: 'Категория', type: 'text', list: RAW.categories.map(c => c.name), required: false,
-        value: editing ? RAW.categories.find(c => c.id === tx.category_id)?.name : '' },
+        value: editing ? RAW.categories.find(c => c.id === tx.category_id)?.name : preset.category ?? '' },
       { name: 'merchant', label: 'Комментарий', type: 'text', required: false, value: editing ? tx.merchant : '' },
       { name: 'date', label: 'Дата', type: 'date', value: editing ? tx.occurred_at.slice(0, 10) : TODAY },
     ],
@@ -543,6 +639,7 @@ async function newTx(kind, tx) {
     kind: income ? 'income' : 'purchase', merchant: v.merchant?.trim() || null, category_id: await categoryId(v.category),
   };
   if (editing) return mutate(sb.from('transactions').update(row).eq('id', tx.id));
+  if (preset.recurring) row.recurring_income_id = preset.recurring;
   return mutate(sb.from('transactions').insert({ ...row, source: 'manual', dedup_hash: `manual:${uid()}` }), income ? 'Доход сохранён' : 'Расход сохранён');
 }
 
@@ -633,6 +730,67 @@ async function editWish(w) {
   return mutate(sb.from('wishlist_items').update(row).eq('id', w.id));
 }
 
+async function editIncome(inc) {
+  const isNew = !inc;
+  const v = await form({
+    title: isNew ? 'Регулярный доход' : inc.name,
+    text: 'Если день выплаты выпадает на выходной, обычно платят в предыдущий рабочий день.',
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: inc?.name ?? 'Зарплата' },
+      { name: 'amount', label: 'Сумма на руки, ₽', value: inc?.amount ?? '' },
+      { name: 'day', label: 'Число месяца (31 — последний день)', value: inc?.day_of_month ?? '' },
+      { name: 'account', label: 'На какой счёт', type: 'select', required: false, value: inc?.account_id ?? '',
+        options: [{ value: '', label: 'Не указан' }, ...accountOptions(a => a.kind in MONEY_KINDS)] },
+      { name: 'shift', label: 'С выходных переносится', type: 'select', value: inc ? String(inc.shift_weekend) : 'true',
+        options: [{ value: 'true', label: 'На пятницу' }, { value: 'false', label: 'Не переносится' }] },
+    ],
+    actions: isNew ? [] : [{ value: 'delete', label: 'Удалить' }],
+  });
+  if (!v) return;
+  if (v.$action === 'delete') return mutate(sb.from('recurring_incomes').update({ is_active: false }).eq('id', inc.id), 'Удалено');
+  const day = Math.round(num(v.day));
+  if (!(day >= 1 && day <= 31)) return toast('Число месяца — от 1 до 31');
+  const row = { name: v.name.trim(), amount: num(v.amount), day_of_month: day, account_id: v.account || null, shift_weekend: v.shift === 'true' };
+  if (isNew) return mutate(sb.from('recurring_incomes').insert({ ...row, owner_id: USER.id }), 'Доход добавлен');
+  return mutate(sb.from('recurring_incomes').update(row).eq('id', inc.id));
+}
+
+async function exportMonth() {
+  const months = [...new Set([TODAY.slice(0, 7), ...RAW.txs.map(t => t.occurred_at.slice(0, 7))])].sort().reverse();
+  const v = await form({ title: 'Выгрузка операций', text: 'Файл CSV открывается в Excel и Google Таблицах.', submit: 'Скачать', fields: [
+    { name: 'month', label: 'Месяц', type: 'select', value: months[0], options: months.map(m => ({ value: m, label: E.monthName(m) })) },
+    { name: 'account', label: 'Счёт', type: 'select', value: '', required: false, options: [{ value: '', label: 'Все счета' }, ...accountOptions()] },
+  ] });
+  if (!v || v.$action) return;
+  const list = RAW.txs.filter(t => t.occurred_at.slice(0, 7) === v.month && (!v.account || t.account_id === v.account))
+    .sort((a, b) => a.occurred_at.localeCompare(b.occurred_at));
+  const KIND = { purchase: 'Расход', income: 'Доход', transfer_in: 'Перевод (приход)', transfer_out: 'Перевод (расход)', fee: 'Комиссия', interest: 'Проценты', repayment: 'Погашение', refund: 'Возврат', cash_withdrawal: 'Снятие наличных' };
+  const cell = x => `"${String(x ?? '').replace(/"/g, '""')}"`;
+  const money = x => Number(x).toFixed(2).replace('.', ',');
+  const lines = [['Дата', 'Счёт', 'Тип', 'Категория', 'Комментарий', 'Сумма', 'Источник'].map(cell).join(';')];
+  for (const t of list) {
+    const a = RAW.acc.get(t.account_id);
+    lines.push([t.occurred_at.slice(0, 10).split('-').reverse().join('.'), a ? accLabel(a) : '', KIND[t.kind] ?? t.kind,
+      RAW.categories.find(c => c.id === t.category_id)?.name ?? '', t.merchant ?? '', money(t.amount), ({ manual: 'вручную', push: 'пуш', sms: 'SMS', statement: 'выписка', api: 'API' })[t.source] ?? t.source].map(cell).join(';'));
+  }
+  // Итоги по счетам — для сверки с выпиской банка.
+  lines.push('', [cell('Итоги по счетам'), cell('Приход'), cell('Расход'), cell('Итого')].join(';'));
+  const byAcc = new Map();
+  for (const t of list) {
+    const r = byAcc.get(t.account_id) ?? { inc: 0, exp: 0 };
+    if (t.amount > 0) r.inc += Number(t.amount); else r.exp += Number(t.amount);
+    byAcc.set(t.account_id, r);
+  }
+  for (const [id, r] of byAcc) lines.push([cell(accLabel(RAW.acc.get(id) || { name: '?' })), money(r.inc), money(r.exp), money(r.inc + r.exp)].join(';'));
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `операции-${v.month}${v.account ? '-' + (RAW.acc.get(v.account)?.name ?? '') : ''}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast(`Выгружено операций: ${list.length}`);
+}
+
 $app.addEventListener('input', e => {
   if (e.target.id !== 'prepay') return;
   const l = STATE.loans.find(x => x.id === e.target.dataset.loanId);
@@ -650,6 +808,13 @@ $app.addEventListener('click', async e => {
 
   if (el.id === 'logout') { await sb.auth.signOut(); return renderLogin(); }
   if (d.newTx) return newTx(d.newTx);
+  if (d.newIncome !== undefined) return editIncome(null);
+  if (d.income) return editIncome(RAW.incomes.find(i => i.id === d.income));
+  if (d.export !== undefined) return exportMonth();
+  if (d.receive) {
+    const inc = RAW.incomes.find(i => i.id === d.receive);
+    return newTx('income', null, { amount: inc.amount, account: inc.account_id, category: inc.name, recurring: inc.id });
+  }
   if (d.tx) {
     const t = RAW.txs.find(x => x.id === d.tx);
     if (t.link_id) {

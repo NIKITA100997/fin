@@ -187,3 +187,5 @@ details > summary::-webkit-details-marker { display: none; }
 nav.tabs > div { grid-template-columns: repeat(5, 1fr); }
 nav.tabs a { font-size: 10.5px; }
 @media (prefers-color-scheme: dark) { .item-amt.pos { color: #6FD3A0; } }
+b.pos, .pos { color: #1F7A4D; }
+@media (prefers-color-scheme: dark) { b.pos, .pos { color: #6FD3A0; } }

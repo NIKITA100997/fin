@@ -1,5 +1,5 @@
 // Кэш оболочки приложения: открывается и без сети, данные — всегда свежие из Supabase.
-const CACHE = 'fin-v2';
+const CACHE = 'fin-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'engine.js', 'config.js', 'manifest.webmanifest', 'icons/icon-192.png'];
 
 self.addEventListener('install', e => {

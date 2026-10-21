@@ -130,3 +130,22 @@ export function loadByMonth(cal) {
   for (const o of cal) if (o.counts) { const k = o.date.slice(0, 7); m.set(k, (m.get(k) ?? 0) + o.amount); }
   return m;
 }
+
+// ---------- доходы ----------
+/** Если день выплаты выпадает на выходной — выплата в предыдущий рабочий день (праздники не учитываются). */
+export function prevWorkday(d) {
+  const w = parse(d).getUTCDay();
+  return w === 6 ? addDays(d, -1) : w === 0 ? addDays(d, -2) : d;
+}
+
+/** Даты выплат регулярного дохода в интервале [from, horizon]. */
+export function incomeDates(inc, from, horizon) {
+  const out = [];
+  for (let i = -1; i < 36; i++) {
+    const planned = monthDay(from, i, inc.day);
+    const pay = inc.shiftWeekend ? prevWorkday(planned) : planned;
+    if (pay > horizon) break;
+    if (pay >= from) out.push(pay);
+  }
+  return out;
+}
