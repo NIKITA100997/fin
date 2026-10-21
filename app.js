@@ -12,17 +12,23 @@ const $dlg = document.getElementById('dlg');
 const TODAY = E.todayISO();
 const HORIZON = E.monthDay(TODAY, 4, 31);
 
+let USER = null;   // текущий пользователь
 let RAW = null;    // строки из БД
 let STATE = null;  // вход движка
 let CAL = [];      // календарь
 
+const DEBT_KINDS = new Set(['credit_card', 'loan', 'installment']);
+const MONEY_KINDS = { debit: 'Карта или счёт', cash: 'Наличные', savings: 'Накопления', brokerage: 'Инвестиции' };
+
 // ---------------------------------------------------------------- утилиты
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const num = s => { const v = parseFloat(String(s).replace(/\s|\u00a0/g, '').replace(',', '.')); return Number.isFinite(v) ? v : null; };
+const num = s => { const v = parseFloat(String(s ?? '').replace(/\s|\u00a0/g, '').replace(',', '.')); return Number.isFinite(v) ? v : null; };
 const plural = (n, a, b, c) => { const m = n % 10, h = n % 100; return m === 1 && h !== 11 ? a : m >= 2 && m <= 4 && (h < 10 || h >= 20) ? b : c; };
 const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 const pct = v => `${Number(v).toFixed(1).replace('.', ',')}%`;
 const inDays = d => { const n = E.diffDays(TODAY, d); return n === 0 ? 'сегодня' : n === 1 ? 'завтра' : n < 0 ? `${-n} ${plural(-n, 'день', 'дня', 'дней')} назад` : `через ${n} ${plural(n, 'день', 'дня', 'дней')}`; };
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+const accLabel = a => a.kind === 'credit_card' ? `${a.bank}, кредитка` : a.kind === 'loan' ? `Кредит ${a.bank}` : a.name;
 
 function toast(text) {
   const t = document.createElement('div');
@@ -31,19 +37,28 @@ function toast(text) {
   setTimeout(() => t.remove(), 2200);
 }
 
-function form({ title, fields, submit = 'Сохранить', danger }) {
+/**
+ * Модальная форма. Поля: { name, label, type: 'money'|'text'|'date'|'select', value, options, list, required }.
+ * actions — дополнительные кнопки: [{ value, label }]; результат { $action: value }.
+ */
+function form({ title, text, fields = [], submit = 'Сохранить', actions = [] }) {
+  const input = f => {
+    const req = f.required === false ? '' : 'required';
+    if (f.type === 'select') return `<select name="${f.name}" ${req}>${f.options.map(o =>
+      `<option value="${esc(o.value)}" ${String(o.value) === String(f.value ?? '') ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>`;
+    if (f.type === 'date') return `<input name="${f.name}" type="date" value="${esc(f.value ?? '')}" ${req}>`;
+    if (f.type === 'text') return `<input name="${f.name}" type="text" value="${esc(f.value ?? '')}" ${f.list ? `list="dl-${f.name}"` : ''} ${req}>
+      ${f.list ? `<datalist id="dl-${f.name}">${f.list.map(v => `<option value="${esc(v)}">`).join('')}</datalist>` : ''}`;
+    return `<input name="${f.name}" type="text" inputmode="decimal" value="${esc(f.value ?? '')}" ${req}>`;
+  };
   $dlg.innerHTML = `
     <form method="dialog">
       <h2>${esc(title)}</h2>
-      ${fields.map(f => `
-        <label class="field">${esc(f.label)}
-          <input name="${f.name}" type="${f.type || 'text'}" ${f.type ? '' : 'inputmode="decimal"'}
-                 value="${esc(f.value ?? '')}" ${f.required === false ? '' : 'required'}>
-        </label>`).join('')}
-      <p class="error" id="dlg-err" hidden></p>
+      ${text ? `<p class="muted small" style="margin:0">${esc(text)}</p>` : ''}
+      ${fields.map(f => `<label class="field">${esc(f.label)}${input(f)}</label>`).join('')}
       <div class="btns">
-        <button class="btn" value="ok">${esc(submit)}</button>
-        ${danger ? `<button class="btn ghost" value="danger" formnovalidate>${esc(danger)}</button>` : ''}
+        ${submit ? `<button class="btn" value="ok">${esc(submit)}</button>` : ''}
+        ${actions.map(a => `<button class="btn ghost" value="act:${a.value}" formnovalidate>${esc(a.label)}</button>`).join('')}
         <button class="btn ghost" value="cancel" formnovalidate>Отмена</button>
       </div>
     </form>`;
@@ -52,9 +67,8 @@ function form({ title, fields, submit = 'Сохранить', danger }) {
     $dlg.addEventListener('close', () => {
       const v = $dlg.returnValue;
       if (v === 'cancel' || !v) return resolve(null);
-      if (v === 'danger') return resolve({ $danger: true });
-      const fd = new FormData($dlg.querySelector('form'));
-      resolve(Object.fromEntries(fd.entries()));
+      if (v.startsWith('act:')) return resolve({ $action: v.slice(4) });
+      resolve(Object.fromEntries(new FormData($dlg.querySelector('form')).entries()));
     }, { once: true });
   });
 }
@@ -68,34 +82,49 @@ async function mutate(promise, done = 'Сохранено') {
 // ---------------------------------------------------------------- данные
 async function load() {
   const all = await Promise.all([
-    sb.from('accounts').select('*').eq('is_archived', false),
+    sb.from('accounts').select('*').eq('is_archived', false).order('created_at'),
     sb.from('balance_snapshots').select('*').order('at', { ascending: false }),
     sb.from('card_terms').select('*'),
     sb.from('grace_buckets').select('*').eq('status', 'open').order('due_date'),
     sb.from('loans').select('*'),
     sb.from('installment_plans').select('*'),
+    sb.from('transactions').select('*').order('occurred_at', { ascending: false }).range(0, 1999),
+    sb.from('categories').select('*').order('name'),
+    sb.from('goals').select('*').order('created_at'),
+    sb.from('wishlist_items').select('*').is('bought_at', null).order('priority'),
   ]);
   const err = all.find(r => r.error);
   if (err) throw err.error;
-  const [accounts, snaps, terms, buckets, loans, plans] = all.map(r => r.data);
+  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist] = all.map(r => r.data);
 
   const acc = new Map(accounts.map(a => [a.id, a]));
   const latest = new Map();
   for (const s of snaps) if (!latest.has(s.account_id)) latest.set(s.account_id, s);
-  const bal = id => Number(latest.get(id)?.balance ?? 0);
 
-  RAW = { accounts, acc, latest, terms, buckets, loans, plans };
+  // Баланс = последний снимок + операции, внесённые после него.
+  // Для долговых счетов расход увеличивает долг, погашение — уменьшает.
+  const balance = new Map();
+  for (const a of accounts) {
+    const s = latest.get(a.id);
+    let v = Number(s?.balance ?? 0);
+    for (const t of txs) {
+      if (t.account_id !== a.id) continue;
+      if (s && t.created_at <= s.at) continue;
+      v += DEBT_KINDS.has(a.kind) ? -Number(t.amount) : Number(t.amount);
+    }
+    balance.set(a.id, v);
+  }
+  const bal = id => balance.get(id) ?? 0;
+
+  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist };
 
   STATE = {
     cards: terms.filter(t => acc.has(t.account_id)).map(t => {
       const a = acc.get(t.account_id);
       return {
-        id: a.id, name: a.bank, limit: Number(a.credit_limit ?? 0), debt: bal(a.id),
-        rate: Number(t.rate_purchase),
+        id: a.id, name: a.bank, limit: Number(a.credit_limit ?? 0), debt: bal(a.id), rate: Number(t.rate_purchase),
         terms: {
-          graceType: t.grace_type,
-          statementDay: t.statement_day ?? 31,
-          payWindowDays: t.pay_window_days,
+          graceType: t.grace_type, statementDay: t.statement_day ?? 31, payWindowDays: t.pay_window_days,
           minDueRule: t.grace_type === 'monthly_cohort' ? 'next_report' : 'window',
           minPct: Number(t.min_pct), minFloor: Number(t.min_floor), minRoundTo: Number(t.min_round_to || 1),
         },
@@ -128,21 +157,27 @@ async function load() {
   CAL = E.buildCalendar(STATE, TODAY, HORIZON);
 }
 
+const moneyAccounts = () => RAW.accounts.filter(a => a.kind in MONEY_KINDS);
+const assetsTotal = () => moneyAccounts().reduce((s, a) => s + RAW.bal(a.id), 0);
+const debtsTotal = () => RAW.accounts.filter(a => DEBT_KINDS.has(a.kind)).reduce((s, a) => s + RAW.bal(a.id), 0);
+
 const staleNote = id => {
   const s = RAW.latest.get(id);
-  if (!s) return 'долг не указан';
+  if (!s) return 'остаток не указан';
   const d = E.diffDays(s.at.slice(0, 10), TODAY);
-  return d === 0 ? 'обновлено сегодня' : `обновлено ${d} ${plural(d, 'день', 'дня', 'дней')} назад`;
+  return d === 0 ? 'сверено сегодня' : `сверено ${d} ${plural(d, 'день', 'дня', 'дней')} назад`;
 };
 
 // ---------------------------------------------------------------- навигация
 const ICONS = {
   overview: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
-  cards: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
-  loan: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  money: '<path d="M3 7h15a3 3 0 0 1 3 3v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 7l12-4v4"/><circle cx="16.5" cy="14" r="1.2"/>',
+  debts: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
+  goals: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
 };
-const TABS = [['overview', 'Обзор'], ['cards', 'Карты'], ['loan', 'Кредит'], ['calendar', 'Календарь']];
+const TABS = [['overview', 'Обзор'], ['money', 'Деньги'], ['debts', 'Долги'], ['goals', 'Цели'], ['calendar', 'Календарь']];
+const ALIAS = { cards: 'debts', loan: 'debts' };
 
 function renderTabs(current) {
   $tabs.hidden = false;
@@ -153,19 +188,20 @@ function renderTabs(current) {
 }
 
 function route() {
-  const id = (location.hash || '#overview').slice(1);
-  const view = { overview: viewOverview, cards: viewCards, loan: viewLoan, calendar: viewCalendar }[id] || viewOverview;
-  renderTabs(id in { overview: 1, cards: 1, loan: 1, calendar: 1 } ? id : 'overview');
-  $app.innerHTML = view();
-  window.scrollTo(0, 0);
+  let id = (location.hash || '#overview').slice(1);
+  id = ALIAS[id] || id;
+  const views = { overview: viewOverview, money: viewMoney, debts: viewDebts, goals: viewGoals, calendar: viewCalendar };
+  if (!views[id]) id = 'overview';
+  renderTabs(id);
+  $app.innerHTML = views[id]();
 }
 
-// ---------------------------------------------------------------- экраны
-function obligationRow(o, { withDate = true, strip = '' } = {}) {
+// ---------------------------------------------------------------- общие блоки
+function obligationRow(o, { strip = '' } = {}) {
   const title = strip && o.title.startsWith(strip + ': ') ? cap(o.title.slice(strip.length + 2)) : o.title;
   return `<div class="item ${o.counts ? '' : 'dim'}">
     <div class="item-left">
-      ${withDate ? `<div class="date-col">${E.ru(o.date)}</div>` : ''}
+      <div class="date-col">${E.ru(o.date)}</div>
       <div class="item-main">
         <div class="item-title">${esc(title)}</div>
         ${o.note ? `<div class="item-note">${esc(o.note)}</div>` : ''}
@@ -175,6 +211,41 @@ function obligationRow(o, { withDate = true, strip = '' } = {}) {
   </div>`;
 }
 
+function txRows(list) {
+  // Перевод — две строки с общим link_id; показываем одну.
+  const seen = new Set();
+  return list.filter(t => {
+    if (!t.link_id) return true;
+    if (seen.has(t.link_id)) return false;
+    seen.add(t.link_id); return true;
+  }).map(t => {
+    const a = RAW.acc.get(t.account_id);
+    const cat = RAW.categories.find(c => c.id === t.category_id)?.name;
+    let title, sub, amt, cls = '';
+    if (t.link_id) {
+      const pair = RAW.txs.find(x => x.link_id === t.link_id && x.id !== t.id);
+      const from = t.amount < 0 ? t : pair, to = t.amount < 0 ? pair : t;
+      title = 'Перевод';
+      sub = `${accLabel(RAW.acc.get(from?.account_id) || {})} → ${accLabel(RAW.acc.get(to?.account_id) || {})}`;
+      amt = E.rub(Math.abs(t.amount));
+      cls = 'muted';
+    } else {
+      title = t.merchant || cat || (t.amount < 0 ? 'Расход' : 'Доход');
+      sub = [cat && t.merchant ? cat : null, a ? accLabel(a) : null].filter(Boolean).join(', ');
+      amt = (t.amount > 0 ? '+' : '−') + E.rub(Math.abs(t.amount));
+      cls = t.amount > 0 ? 'pos' : '';
+    }
+    return `<button class="item item-btn" data-tx="${t.id}">
+      <div class="item-left">
+        <div class="date-col">${E.ru(t.occurred_at.slice(0, 10))}</div>
+        <div class="item-main"><div class="item-title">${esc(title)}</div><div class="item-note">${esc(sub)}</div></div>
+      </div>
+      <div class="item-amt ${cls}">${amt}</div>
+    </button>`;
+  }).join('');
+}
+
+// ---------------------------------------------------------------- Обзор
 function viewOverview() {
   const upcoming = CAL.filter(o => o.counts && o.date >= TODAY);
   const next = upcoming[0];
@@ -182,14 +253,7 @@ function viewOverview() {
   const soon = upcoming.filter(o => o.date <= in30);
   const months = [...E.loadByMonth(CAL)].slice(0, 4);
   const max = Math.max(1, ...months.map(([, v]) => v));
-
-  const debts = [
-    ...STATE.loans.map(l => ({ name: l.name, debt: l.balance, id: l.id })),
-    ...STATE.cards.map(c => ({ name: `${c.name}, кредитка`, debt: c.debt, limit: c.limit, id: c.id })),
-    ...STATE.installments.map(p => ({ name: p.name, debt: p.debt, limit: p.limit, id: p.id })),
-  ].sort((a, b) => b.debt - a.debt);
-  const total = debts.reduce((s, d) => s + d.debt, 0);
-
+  const assets = assetsTotal(), debts = debtsTotal();
   const funding = STATE.installments.filter(p => p.fundingAccount && p.nextDate && E.diffDays(TODAY, p.nextDate) <= 7);
 
   return `
@@ -203,9 +267,22 @@ function viewOverview() {
           <div class="next-what">${esc(next.title)}</div>
           <div class="next-note">${inDays(next.date)}</div>
         </div>
-      </section>` : `<section class="panel"><h2>Платежей не запланировано</h2><p class="muted small">Добавьте долги и сроки на вкладке «Карты».</p></section>`}
+      </section>` : ''}
 
       ${funding.map(p => `<div class="notice">До ${E.ru(p.nextDate)} пополните счёт «${esc(p.fundingAccount)}» на ${E.rub(p.nextAmount)}: ${esc(p.name)} списывается автоматически.</div>`).join('')}
+
+      <section class="panel">
+        <div class="kv kv3">
+          <div><span>Деньги</span><b>${E.rub(assets)}</b></div>
+          <div><span>Долги</span><b>${E.rub(debts)}</b></div>
+          <div><span>Капитал</span><b class="${assets - debts < 0 ? 'neg' : ''}">${assets - debts < 0 ? '−' : ''}${E.rub(Math.abs(assets - debts))}</b></div>
+        </div>
+        <div class="btns">
+          <button class="btn small" data-new-tx="expense">Расход</button>
+          <button class="btn ghost small" data-new-tx="income">Доход</button>
+          <button class="btn ghost small" data-new-tx="transfer">Перевод</button>
+        </div>
+      </section>
 
       <section class="panel">
         <div class="panel-head"><h2>Следующие 30 дней</h2><a class="btn link" href="#calendar">Весь календарь</a></div>
@@ -213,8 +290,9 @@ function viewOverview() {
         ${soon.length ? `<div class="total"><span>Итого</span><span>${E.rub(soon.reduce((s, o) => s + o.amount, 0))}</span></div>` : ''}
       </section>
 
+      ${months.length ? `
       <section class="panel">
-        <h2>Нагрузка по месяцам</h2>
+        <h2>Платежи по месяцам</h2>
         <div class="months">
           ${months.map(([m, v]) => `
             <div class="month">
@@ -223,61 +301,46 @@ function viewOverview() {
               <div class="month-label">${E.monthName(m).split(' ')[0]}</div>
             </div>`).join('')}
         </div>
+      </section>` : ''}
+    </div>`;
+}
+
+// ---------------------------------------------------------------- Деньги
+function viewMoney() {
+  const accs = moneyAccounts();
+  return `
+    <div class="top"><h1>Деньги</h1><button class="btn ghost small" data-new-acc>Новый счёт</button></div>
+    <div class="stack">
+      <section class="panel">
+        ${accs.map(a => `
+          <button class="item item-btn" data-acc="${a.id}">
+            <div class="item-main">
+              <div class="item-title">${esc(a.name)}</div>
+              <div class="item-note">${esc(a.bank ? `${a.bank}, ` : '')}${MONEY_KINDS[a.kind].toLowerCase()}; ${staleNote(a.id)}</div>
+            </div>
+            <div class="item-amt">${E.rub(RAW.bal(a.id))}</div>
+          </button>`).join('') || '<p class="muted small">Добавьте карты, наличные и накопления, чтобы видеть свои деньги и капитал.</p>'}
+        ${accs.length ? `<div class="total"><span>Всего</span><span>${E.rub(assetsTotal())}</span></div>` : ''}
       </section>
 
       <section class="panel">
-        <h2>Долги</h2>
-        ${debts.map(d => `
-          <div class="item">
-            <div class="item-main">
-              <div class="item-title">${esc(d.name)}</div>
-              <div class="item-note">${d.limit ? `лимит ${E.rub(d.limit)}, ` : ''}${staleNote(d.id)}</div>
-            </div>
-            <div class="item-amt">${E.rub(d.debt)}</div>
-          </div>`).join('')}
-        <div class="total"><span>Всего</span><span>${E.rub(total)}</span></div>
+        <div class="panel-head"><h2>Операции</h2></div>
+        <div class="btns" style="margin:0 0 8px">
+          <button class="btn small" data-new-tx="expense">Расход</button>
+          <button class="btn ghost small" data-new-tx="income">Доход</button>
+          <button class="btn ghost small" data-new-tx="transfer">Перевод</button>
+        </div>
+        ${txRows(RAW.txs.slice(0, 60)) || '<p class="muted small">Операций пока нет.</p>'}
       </section>
     </div>`;
 }
 
+// ---------------------------------------------------------------- Долги
 const GRACE_LABEL = {
   per_statement: 'Без процентов, если до срока погасить сумму по выписке',
   monthly_cohort: 'Покупки месяца без процентов до конца третьего месяца после',
   per_tranche: 'У каждой покупки свой срок без процентов',
 };
-
-function viewCards() {
-  const cards = STATE.cards.map(c => {
-    const t = RAW.terms.find(x => x.account_id === c.id);
-    const obl = CAL.filter(o => o.account === c.id);
-    const used = c.limit ? Math.min(100, c.debt / c.limit * 100) : 0;
-    return `
-      <section class="panel">
-        <div class="panel-head"><h2>${esc(c.name)}</h2><span class="badge">${pct(c.rate)} вне льготы</span></div>
-        <div class="row"><b>${E.rub(c.debt)}</b><span class="muted small">из ${E.rub(c.limit)}</span></div>
-        <div class="meter"><div style="width:${used}%"></div></div>
-        <div class="item-note">${esc(GRACE_LABEL[t.grace_type])}. ${cap(staleNote(c.id))}.</div>
-        <div style="margin-top:8px">${obl.map(o => obligationRow(o, { strip: c.name })).join('') || '<p class="muted small">Платежей нет.</p>'}</div>
-        ${c.buckets.length ? `<div class="small muted" style="margin-top:8px">Сроки из приложения банка: нажмите, чтобы изменить</div>
-          ${c.buckets.map(b => `<button class="item btn ghost small" style="width:100%;margin-top:6px" data-bucket="${b.id}" data-acc="${c.id}">
-            <span>до ${E.ru(b.due)}</span><span>${E.rub(b.amount)}</span></button>`).join('')}` : ''}
-        <div class="btns">
-          <button class="btn small" data-debt="${c.id}">Обновить долг</button>
-          <button class="btn ghost small" data-add-bucket="${c.id}">Добавить срок</button>
-        </div>
-      </section>`;
-  });
-  const inst = STATE.installments.map(p => `
-    <section class="panel">
-      <div class="panel-head"><h2>${esc(p.name)}</h2><span class="badge">рассрочка</span></div>
-      <div class="row"><b>${E.rub(p.debt)}</b><span class="muted small">из ${E.rub(p.limit)}</span></div>
-      <div class="meter"><div style="width:${p.limit ? Math.min(100, p.debt / p.limit * 100) : 0}%"></div></div>
-      <div class="item-note">Платёж раз в ${p.periodDays} дней${p.fundingAccount ? `, списывается с «${esc(p.fundingAccount)}»` : ''}. ${cap(staleNote(p.id))}.</div>
-      <div style="margin-top:8px">${CAL.filter(o => o.account === p.id).map(o => obligationRow({ ...o, title: 'Платёж' })).join('')}</div>
-      <div class="btns"><button class="btn small" data-inst="${p.id}">Обновить</button></div>
-    </section>`);
-  return `<div class="top"><h1>Карты</h1></div><div class="stack">${cards.join('')}${inst.join('')}</div>`;
-}
 
 function cmpHtml(l, amount) {
   const { rate } = E.loanRateAnnual(l);
@@ -290,46 +353,120 @@ function cmpHtml(l, amount) {
   </div>`;
 }
 
-function viewLoan() {
-  const l = STATE.loans[0];
-  if (!l) return `<div class="top"><h1>Кредит</h1></div><p class="muted">Кредитов нет.</p>`;
-  const { rate, estimated } = E.loanRateAnnual(l);
-  const rows = E.loanSchedule(l, 6);
-  const amount = Number(sessionStorage.getItem('prepay') || 100000);
-  const lastDate = E.monthDay(l.nextDate, l.remaining - 1, l.payDay);
-  return `
-    <div class="top"><h1>Кредит</h1><button class="btn ghost small" data-loan="${l.id}">Изменить</button></div>
-    <div class="stack">
+function loanPanels() {
+  return STATE.loans.map(l => {
+    const { rate, estimated } = E.loanRateAnnual(l);
+    const rows = E.loanSchedule(l, 6);
+    const amount = Number(sessionStorage.getItem('prepay') || 100000);
+    const lastDate = E.monthDay(l.nextDate, l.remaining - 1, l.payDay);
+    return `
       <section class="panel">
-        <div class="muted small">${esc(l.name)}, ${staleNote(l.id)}</div>
-        <div style="font-size:30px;font-weight:800;letter-spacing:-0.5px">${E.rub(l.balance)}</div>
+        <div class="panel-head"><h2>${esc(l.name)}</h2><button class="btn link" data-loan="${l.id}">Изменить</button></div>
+        <div style="font-size:28px;font-weight:800;letter-spacing:-0.5px">${E.rub(l.balance)}</div>
+        <div class="item-note">${cap(staleNote(l.id))}</div>
         <div class="kv">
-          <div><span>Платёж</span><b>${E.rub(l.payment)}</b></div>
+          <div><span>Платёж ${E.ru(l.nextDate)}</span><b>${E.rub(l.payment)}</b></div>
           <div><span>Ставка</span><b>${pct(rate * 100)}${estimated ? ' (оценка)' : ''}</b></div>
           <div><span>Осталось</span><b>${l.remaining} ${plural(l.remaining, 'платёж', 'платежа', 'платежей')}</b></div>
           <div><span>Последний</span><b>${E.monthName(lastDate.slice(0, 7)).toLowerCase()}</b></div>
         </div>
-      </section>
+        <details style="margin-top:12px">
+          <summary class="btn link" style="padding:0">Досрочка и график</summary>
+          <label class="field" style="margin-top:8px">Сумма досрочки
+            <input type="text" inputmode="decimal" id="prepay" data-loan-id="${l.id}" value="${amount}">
+          </label>
+          <div id="cmp">${cmpHtml(l, amount)}</div>
+          <p class="muted small" style="margin:10px 0">Экономия на процентах за весь срок, расчёт приблизительный.</p>
+          <table class="sched">
+            <thead><tr><th>Дата</th><th>Проценты</th><th>Долг</th><th>Остаток</th></tr></thead>
+            <tbody>${rows.map(r => `<tr><td>${E.ru(r.date)}</td><td>${E.rub(r.interest)}</td><td>${E.rub(r.principal)}</td><td>${E.rub(r.balance)}</td></tr>`).join('')}</tbody>
+          </table>
+        </details>
+      </section>`;
+  }).join('');
+}
 
+function viewDebts() {
+  const cards = STATE.cards.map(c => {
+    const t = RAW.terms.find(x => x.account_id === c.id);
+    const obl = CAL.filter(o => o.account === c.id);
+    const used = c.limit ? Math.min(100, c.debt / c.limit * 100) : 0;
+    return `
       <section class="panel">
-        <h2>Досрочное погашение</h2>
-        <label class="field" style="margin-top:8px">Сумма
-          <input type="text" inputmode="decimal" id="prepay" value="${amount}">
-        </label>
-        <div id="cmp">${cmpHtml(l, amount)}</div>
-        <p class="muted small" style="margin:10px 0 0">Экономия на процентах за весь срок. Расчёт приблизительный${estimated ? ': ставка оценена по остатку и платежу' : ''}.</p>
-      </section>
+        <div class="panel-head"><h2>${esc(c.name)}, кредитка</h2><span class="badge">${pct(c.rate)} вне льготы</span></div>
+        <div class="row"><b>${E.rub(c.debt)}</b><span class="muted small">из ${E.rub(c.limit)}</span></div>
+        <div class="meter"><div style="width:${used}%"></div></div>
+        <div class="item-note">${esc(GRACE_LABEL[t.grace_type])}. ${cap(staleNote(c.id))}.</div>
+        <div style="margin-top:8px">${obl.map(o => obligationRow(o, { strip: c.name })).join('') || '<p class="muted small">Платежей нет.</p>'}</div>
+        ${c.buckets.length ? `<div class="small muted" style="margin-top:8px">Сроки из приложения банка</div>
+          ${c.buckets.map(b => `<button class="item item-btn" data-bucket="${b.id}">
+            <span>до ${E.ru(b.due)}</span><span class="item-amt">${E.rub(b.amount)}</span></button>`).join('')}` : ''}
+        <div class="btns">
+          <button class="btn small" data-debt="${c.id}">Сверить долг</button>
+          <button class="btn ghost small" data-add-bucket="${c.id}">Добавить срок</button>
+        </div>
+      </section>`;
+  });
+  const inst = STATE.installments.map(p => `
+    <section class="panel">
+      <div class="panel-head"><h2>${esc(p.name)}</h2><span class="badge">рассрочка</span></div>
+      <div class="row"><b>${E.rub(p.debt)}</b><span class="muted small">из ${E.rub(p.limit)}</span></div>
+      <div class="meter"><div style="width:${p.limit ? Math.min(100, p.debt / p.limit * 100) : 0}%"></div></div>
+      <div class="item-note">Платёж раз в ${p.periodDays} дней${p.fundingAccount ? `, списывается со счёта «${esc(p.fundingAccount)}»` : ''}. ${cap(staleNote(p.id))}.</div>
+      <div style="margin-top:8px">${CAL.filter(o => o.account === p.id).map(o => obligationRow({ ...o, title: 'Платёж' })).join('')}</div>
+      <div class="btns"><button class="btn small" data-inst="${p.id}">Обновить</button></div>
+    </section>`);
+  return `
+    <div class="top"><h1>Долги</h1><span class="muted small">${E.rub(debtsTotal())}</span></div>
+    <div class="stack">${loanPanels()}${cards.join('')}${inst.join('')}</div>`;
+}
 
+// ---------------------------------------------------------------- Цели
+const PRIORITY = { 1: 'хочу сильно', 2: 'хочу', 3: 'когда-нибудь' };
+
+function goalHave(g) { return g.account_id ? RAW.bal(g.account_id) : Number(g.saved ?? 0); }
+
+function viewGoals() {
+  const goals = RAW.goals.map(g => {
+    const have = goalHave(g), target = Number(g.target ?? 0);
+    const left = Math.max(0, target - have);
+    const p = target ? Math.min(100, have / target * 100) : 0;
+    let plan = '';
+    if (left > 0 && g.deadline) {
+      const months = Math.max(1, Math.round(E.diffDays(TODAY, g.deadline) / 30.4));
+      plan = `${E.rub(left / months)} в месяц до ${E.ru(g.deadline)} ${g.deadline.slice(0, 4)}`;
+    } else if (left <= 0 && target) plan = 'Цель достигнута';
+    const src = g.account_id ? `копится на счёте «${RAW.acc.get(g.account_id)?.name ?? '?'}»` : 'сумма ведётся вручную';
+    return `
+      <button class="panel goal" data-goal="${g.id}">
+        <div class="panel-head"><h2>${esc(g.name)}</h2>${g.visibility === 'shared' ? '<span class="badge">общая</span>' : ''}</div>
+        <div class="row"><b>${E.rub(have)}</b><span class="muted small">из ${E.rub(target)}</span></div>
+        <div class="meter"><div style="width:${p}%"></div></div>
+        <div class="item-note">${esc(cap(src))}${plan ? `. ${esc(plan)}` : ''}</div>
+      </button>`;
+  });
+  const wish = RAW.wishlist.map(w => `
+    <button class="item item-btn" data-wish="${w.id}">
+      <div class="item-main">
+        <div class="item-title">${esc(w.name)}</div>
+        <div class="item-note">${PRIORITY[w.priority] ?? ''}${w.goal_id ? ', есть цель' : ''}</div>
+      </div>
+      <div class="item-amt">${w.price ? E.rub(w.price) : ''}</div>
+    </button>`);
+  const wishTotal = RAW.wishlist.reduce((s, w) => s + Number(w.price ?? 0), 0);
+  return `
+    <div class="top"><h1>Цели</h1><button class="btn ghost small" data-new-goal>Новая цель</button></div>
+    <div class="stack">
+      ${goals.join('') || '<section class="panel"><p class="muted small" style="margin:0">Создайте цель: подушка безопасности, отпуск, досрочка по кредиту.</p></section>'}
       <section class="panel">
-        <h2>Ближайшие платежи</h2>
-        <table class="sched">
-          <thead><tr><th>Дата</th><th>Проценты</th><th>Долг</th><th>Остаток</th></tr></thead>
-          <tbody>${rows.map(r => `<tr><td>${E.ru(r.date)}</td><td>${E.rub(r.interest)}</td><td>${E.rub(r.principal)}</td><td>${E.rub(r.balance)}</td></tr>`).join('')}</tbody>
-        </table>
+        <div class="panel-head"><h2>Вишлист</h2><button class="btn link" data-new-wish>Добавить</button></div>
+        ${wish.join('') || '<p class="muted small">Записывайте сюда то, что хочется купить, — потом любую позицию можно превратить в цель.</p>'}
+        ${wish.length ? `<div class="total"><span>Всего</span><span>${E.rub(wishTotal)}</span></div>` : ''}
       </section>
     </div>`;
 }
 
+// ---------------------------------------------------------------- Календарь
 function viewCalendar() {
   const byMonth = new Map();
   for (const o of CAL.filter(o => o.date >= TODAY)) {
@@ -352,12 +489,155 @@ function viewCalendar() {
 
 // ---------------------------------------------------------------- действия
 const SOURCE = { per_statement: 'statement', monthly_cohort: 'cohort', per_tranche: 'tranche' };
+const accountOptions = filter => RAW.accounts.filter(filter || (() => true)).map(a => ({ value: a.id, label: accLabel(a) }));
+
+async function categoryId(name) {
+  name = (name || '').trim();
+  if (!name) return null;
+  const found = RAW.categories.find(c => c.name.toLowerCase() === name.toLowerCase());
+  if (found) return found.id;
+  const { data, error } = await sb.from('categories').insert({ owner_id: USER.id, name }).select().single();
+  if (error) { toast(`Категория не создана: ${error.message}`); return null; }
+  return data.id;
+}
+
+async function newTx(kind, tx) {
+  const editing = !!tx;
+  if (kind === 'transfer') {
+    const v = await form({ title: 'Перевод', text: 'Между своими счетами: погашение кредитки, досрочка по кредиту, снятие наличных.', fields: [
+      { name: 'from', label: 'Откуда', type: 'select', options: accountOptions(), value: moneyAccounts()[0]?.id },
+      { name: 'to', label: 'Куда', type: 'select', options: accountOptions() },
+      { name: 'amount', label: 'Сумма, ₽' },
+      { name: 'date', label: 'Дата', type: 'date', value: TODAY },
+    ], submit: 'Сохранить перевод' });
+    if (!v || !num(v.amount)) return;
+    if (v.from === v.to) return toast('Выберите разные счета');
+    const link = uid(), at = `${v.date}T12:00:00Z`, a = num(v.amount);
+    return mutate(sb.from('transactions').insert([
+      { account_id: v.from, occurred_at: at, amount: -a, kind: 'transfer_out', source: 'manual', dedup_hash: `manual:${uid()}`, link_id: link },
+      { account_id: v.to, occurred_at: at, amount: a, kind: 'transfer_in', source: 'manual', dedup_hash: `manual:${uid()}`, link_id: link },
+    ]), 'Перевод сохранён');
+  }
+  const income = kind === 'income';
+  const v = await form({
+    title: editing ? 'Операция' : income ? 'Доход' : 'Расход',
+    fields: [
+      { name: 'amount', label: 'Сумма, ₽', value: editing ? Math.abs(tx.amount) : '' },
+      { name: 'account', label: income ? 'На счёт' : 'Со счёта или карты', type: 'select',
+        options: accountOptions(a => income ? a.kind in MONEY_KINDS : a.kind in MONEY_KINDS || a.kind === 'credit_card' || a.kind === 'installment'),
+        value: editing ? tx.account_id : (localStorage.getItem('lastAcc') || moneyAccounts()[0]?.id) },
+      { name: 'category', label: 'Категория', type: 'text', list: RAW.categories.map(c => c.name), required: false,
+        value: editing ? RAW.categories.find(c => c.id === tx.category_id)?.name : '' },
+      { name: 'merchant', label: 'Комментарий', type: 'text', required: false, value: editing ? tx.merchant : '' },
+      { name: 'date', label: 'Дата', type: 'date', value: editing ? tx.occurred_at.slice(0, 10) : TODAY },
+    ],
+    actions: editing ? [{ value: 'delete', label: 'Удалить' }] : [],
+  });
+  if (!v) return;
+  if (v.$action === 'delete') return mutate(sb.from('transactions').delete().eq('id', tx.id), 'Удалено');
+  const a = num(v.amount);
+  if (!a) return toast('Укажите сумму');
+  localStorage.setItem('lastAcc', v.account);
+  const row = {
+    account_id: v.account, occurred_at: `${v.date}T12:00:00Z`, amount: income ? a : -a,
+    kind: income ? 'income' : 'purchase', merchant: v.merchant?.trim() || null, category_id: await categoryId(v.category),
+  };
+  if (editing) return mutate(sb.from('transactions').update(row).eq('id', tx.id));
+  return mutate(sb.from('transactions').insert({ ...row, source: 'manual', dedup_hash: `manual:${uid()}` }), income ? 'Доход сохранён' : 'Расход сохранён');
+}
+
+async function editAccount(a) {
+  const isNew = !a;
+  const v = await form({
+    title: isNew ? 'Новый счёт' : a.name,
+    text: isNew ? '' : 'Укажите остаток, как в приложении банка. Операции, внесённые после сверки, учитываются автоматически.',
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: a?.name ?? '' },
+      { name: 'bank', label: 'Банк', type: 'text', required: false, value: a?.bank ?? '' },
+      { name: 'kind', label: 'Тип', type: 'select', options: Object.entries(MONEY_KINDS).map(([value, label]) => ({ value, label })), value: a?.kind ?? 'debit' },
+      { name: 'balance', label: 'Остаток сейчас, ₽', value: isNew ? '' : Math.round(RAW.bal(a.id) * 100) / 100 },
+    ],
+    actions: isNew ? [] : [{ value: 'hide', label: 'Скрыть счёт' }],
+  });
+  if (!v) return;
+  if (v.$action === 'hide') return mutate(sb.from('accounts').update({ is_archived: true }).eq('id', a.id), 'Счёт скрыт');
+  if (isNew) {
+    const { data, error } = await sb.from('accounts').insert({ owner_id: USER.id, name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind }).select().single();
+    if (error) return toast(`Не сохранилось: ${error.message}`);
+    return mutate(sb.from('balance_snapshots').insert({ account_id: data.id, balance: num(v.balance) ?? 0, source: 'manual' }), 'Счёт добавлен');
+  }
+  const r = await sb.from('accounts').update({ name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind }).eq('id', a.id);
+  if (r.error) return toast(`Не сохранилось: ${r.error.message}`);
+  const b = num(v.balance);
+  if (b != null && Math.abs(b - RAW.bal(a.id)) > 0.004) return mutate(sb.from('balance_snapshots').insert({ account_id: a.id, balance: b, source: 'manual' }));
+  await load(); route(); toast('Сохранено');
+}
+
+async function editGoal(g, preset = {}) {
+  const isNew = !g;
+  const v = await form({
+    title: isNew ? 'Новая цель' : g.name,
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: g?.name ?? preset.name ?? '' },
+      { name: 'target', label: 'Сколько нужно, ₽', value: g?.target ?? preset.target ?? '' },
+      { name: 'deadline', label: 'К какой дате (необязательно)', type: 'date', required: false, value: g?.deadline ?? '' },
+      { name: 'account', label: 'Где копится', type: 'select', required: false, value: g?.account_id ?? '',
+        options: [{ value: '', label: 'Веду сумму вручную' }, ...accountOptions(a => a.kind in MONEY_KINDS)] },
+      { name: 'saved', label: 'Уже отложено, ₽ (если вручную)', required: false, value: g?.saved ?? '' },
+    ],
+    actions: isNew ? [] : [{ value: 'delete', label: 'Удалить цель' }],
+  });
+  if (!v) return null;
+  if (v.$action === 'delete') return mutate(sb.from('goals').delete().eq('id', g.id), 'Цель удалена');
+  const row = {
+    name: v.name.trim(), target: num(v.target), deadline: v.deadline || null,
+    account_id: v.account || null, saved: num(v.saved) ?? 0,
+  };
+  if (isNew) {
+    const { data, error } = await sb.from('goals').insert({ ...row, owner_id: USER.id }).select().single();
+    if (error) { toast(`Не сохранилось: ${error.message}`); return null; }
+    return data;
+  }
+  return mutate(sb.from('goals').update(row).eq('id', g.id));
+}
+
+async function editWish(w) {
+  const isNew = !w;
+  const v = await form({
+    title: isNew ? 'Хочу купить' : w.name,
+    fields: [
+      { name: 'name', label: 'Что', type: 'text', value: w?.name ?? '' },
+      { name: 'price', label: 'Примерная цена, ₽', required: false, value: w?.price ?? '' },
+      { name: 'url', label: 'Ссылка', type: 'text', required: false, value: w?.url ?? '' },
+      { name: 'priority', label: 'Насколько хочется', type: 'select', value: w?.priority ?? 2,
+        options: Object.entries(PRIORITY).map(([value, label]) => ({ value, label: cap(label) })) },
+    ],
+    actions: isNew ? [] : [
+      ...(w.goal_id ? [] : [{ value: 'goal', label: 'Сделать целью' }]),
+      ...(w.url ? [{ value: 'open', label: 'Открыть ссылку' }] : []),
+      { value: 'bought', label: 'Куплено' },
+      { value: 'delete', label: 'Удалить' },
+    ],
+  });
+  if (!v) return;
+  if (v.$action === 'open') return window.open(w.url, '_blank', 'noopener');
+  if (v.$action === 'bought') return mutate(sb.from('wishlist_items').update({ bought_at: new Date().toISOString() }).eq('id', w.id), 'Отмечено как купленное');
+  if (v.$action === 'delete') return mutate(sb.from('wishlist_items').delete().eq('id', w.id), 'Удалено');
+  if (v.$action === 'goal') {
+    const goal = await editGoal(null, { name: w.name, target: w.price });
+    if (goal?.id) return mutate(sb.from('wishlist_items').update({ goal_id: goal.id }).eq('id', w.id), 'Цель создана');
+    return;
+  }
+  const row = { name: v.name.trim(), price: num(v.price), url: v.url?.trim() || null, priority: Number(v.priority) };
+  if (isNew) return mutate(sb.from('wishlist_items').insert({ ...row, owner_id: USER.id }), 'Добавлено');
+  return mutate(sb.from('wishlist_items').update(row).eq('id', w.id));
+}
 
 $app.addEventListener('input', e => {
   if (e.target.id !== 'prepay') return;
+  const l = STATE.loans.find(x => x.id === e.target.dataset.loanId);
   const v = num(e.target.value);
-  const l = STATE.loans[0];
-  if (v && v > 0 && v < l.balance) {
+  if (l && v && v > 0 && v < l.balance) {
     sessionStorage.setItem('prepay', String(v));
     document.getElementById('cmp').innerHTML = cmpHtml(l, v);
   }
@@ -366,57 +646,70 @@ $app.addEventListener('input', e => {
 $app.addEventListener('click', async e => {
   const el = e.target.closest('button');
   if (!el) return;
+  const d = el.dataset;
 
   if (el.id === 'logout') { await sb.auth.signOut(); return renderLogin(); }
+  if (d.newTx) return newTx(d.newTx);
+  if (d.tx) {
+    const t = RAW.txs.find(x => x.id === d.tx);
+    if (t.link_id) {
+      const v = await form({ title: 'Перевод', text: `${E.rub(Math.abs(t.amount))}, ${E.ru(t.occurred_at.slice(0, 10))}`, submit: '', actions: [{ value: 'delete', label: 'Удалить перевод' }] });
+      if (v?.$action === 'delete') return mutate(sb.from('transactions').delete().eq('link_id', t.link_id), 'Удалено');
+      return;
+    }
+    return newTx(t.amount > 0 ? 'income' : 'expense', t);
+  }
+  if (d.newAcc !== undefined) return editAccount(null);
+  if (d.acc) return editAccount(RAW.acc.get(d.acc));
+  if (d.newGoal !== undefined) { const g = await editGoal(null); if (g) { await load(); route(); toast('Цель создана'); } return; }
+  if (d.goal) return editGoal(RAW.goals.find(g => g.id === d.goal));
+  if (d.newWish !== undefined) return editWish(null);
+  if (d.wish) return editWish(RAW.wishlist.find(w => w.id === d.wish));
 
-  if (el.dataset.debt) {
-    const id = el.dataset.debt;
-    const v = await form({ title: 'Текущий долг', fields: [{ name: 'debt', label: 'Сумма долга, ₽', value: RAW.latest.get(id)?.balance ?? '' }] });
-    if (v && num(v.debt) != null) mutate(sb.from('balance_snapshots').insert({ account_id: id, balance: num(v.debt), source: 'manual' }));
+  if (d.debt) {
+    const v = await form({ title: 'Текущий долг', text: 'Сумма долга из приложения банка.', fields: [{ name: 'debt', label: 'Долг, ₽', value: Math.round(RAW.bal(d.debt) * 100) / 100 }] });
+    if (v && num(v.debt) != null) mutate(sb.from('balance_snapshots').insert({ account_id: d.debt, balance: num(v.debt), source: 'manual' }));
   }
 
-  if (el.dataset.addBucket) {
-    const id = el.dataset.addBucket;
-    const t = RAW.terms.find(x => x.account_id === id);
+  if (d.addBucket) {
+    const t = RAW.terms.find(x => x.account_id === d.addBucket);
     const v = await form({ title: 'Срок без процентов', fields: [
-      { name: 'due', label: 'Внести до', type: 'date', value: '' },
-      { name: 'amount', label: 'Сумма, ₽', value: '' },
+      { name: 'due', label: 'Внести до', type: 'date' },
+      { name: 'amount', label: 'Сумма, ₽' },
     ], submit: 'Добавить' });
     if (v && num(v.amount)) mutate(sb.from('grace_buckets').upsert(
-      { account_id: id, source: SOURCE[t.grace_type], due_date: v.due, amount: num(v.amount), is_exact: true, status: 'open', paid_amount: 0 },
+      { account_id: d.addBucket, source: SOURCE[t.grace_type], due_date: v.due, amount: num(v.amount), is_exact: true, status: 'open', paid_amount: 0 },
       { onConflict: 'account_id,source,due_date' }), 'Срок добавлен');
   }
 
-  if (el.dataset.bucket) {
-    const b = RAW.buckets.find(x => x.id === el.dataset.bucket);
-    const v = await form({ title: 'Срок без процентов', danger: 'Оплачено', fields: [
+  if (d.bucket) {
+    const b = RAW.buckets.find(x => x.id === d.bucket);
+    const v = await form({ title: 'Срок без процентов', actions: [{ value: 'paid', label: 'Оплачено' }], fields: [
       { name: 'due', label: 'Внести до', type: 'date', value: b.due_date },
       { name: 'amount', label: 'Сумма, ₽', value: b.amount },
     ] });
-    if (v?.$danger) mutate(sb.from('grace_buckets').update({ status: 'paid' }).eq('id', b.id), 'Отмечено как оплаченное');
+    if (v?.$action === 'paid') mutate(sb.from('grace_buckets').update({ status: 'paid' }).eq('id', b.id), 'Отмечено как оплаченное');
     else if (v && num(v.amount)) mutate(sb.from('grace_buckets').update({ due_date: v.due, amount: num(v.amount), is_exact: true, updated_at: new Date().toISOString() }).eq('id', b.id));
   }
 
-  if (el.dataset.inst) {
-    const id = el.dataset.inst;
-    const p = STATE.installments.find(x => x.id === id);
+  if (d.inst) {
+    const p = STATE.installments.find(x => x.id === d.inst);
     const v = await form({ title: p.name, fields: [
       { name: 'debt', label: 'Общий долг, ₽', value: p.debt },
       { name: 'date', label: 'Следующий платёж', type: 'date', value: p.nextDate },
       { name: 'amount', label: 'Сумма платежа, ₽', value: p.nextAmount },
     ] });
     if (v) {
-      const r1 = await sb.from('installment_plans').update({ next_payment_date: v.date, next_payment_amount: num(v.amount) }).eq('account_id', id);
+      const r1 = await sb.from('installment_plans').update({ next_payment_date: v.date, next_payment_amount: num(v.amount) }).eq('account_id', d.inst);
       if (r1.error) return toast(`Не сохранилось: ${r1.error.message}`);
-      mutate(sb.from('balance_snapshots').insert({ account_id: id, balance: num(v.debt), source: 'manual' }));
+      mutate(sb.from('balance_snapshots').insert({ account_id: d.inst, balance: num(v.debt), source: 'manual' }));
     }
   }
 
-  if (el.dataset.loan) {
-    const id = el.dataset.loan;
-    const l = STATE.loans.find(x => x.id === id);
+  if (d.loan) {
+    const l = STATE.loans.find(x => x.id === d.loan);
     const v = await form({ title: 'Кредит', fields: [
-      { name: 'balance', label: 'Остаток долга, ₽', value: l.balance },
+      { name: 'balance', label: 'Остаток долга, ₽', value: Math.round(l.balance * 100) / 100 },
       { name: 'payment', label: 'Ежемесячный платёж, ₽', value: l.payment },
       { name: 'remaining', label: 'Осталось платежей', value: l.remaining },
       { name: 'next', label: 'Следующий платёж', type: 'date', value: l.nextDate },
@@ -426,9 +719,9 @@ $app.addEventListener('click', async e => {
       const r1 = await sb.from('loans').update({
         payment_amount: num(v.payment), remaining_payments: Math.round(num(v.remaining)),
         next_payment_date: v.next, rate_annual: v.rate ? num(v.rate) : null,
-      }).eq('account_id', id);
+      }).eq('account_id', d.loan);
       if (r1.error) return toast(`Не сохранилось: ${r1.error.message}`);
-      mutate(sb.from('balance_snapshots').insert({ account_id: id, balance: num(v.balance), source: 'manual' }));
+      mutate(sb.from('balance_snapshots').insert({ account_id: d.loan, balance: num(v.balance), source: 'manual' }));
     }
   }
 });
@@ -447,8 +740,9 @@ function renderLogin(message = '') {
   document.getElementById('login').addEventListener('submit', async e => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const { error } = await sb.auth.signInWithPassword({ email: fd.get('email'), password: fd.get('password') });
+    const { data, error } = await sb.auth.signInWithPassword({ email: String(fd.get('email')).trim(), password: fd.get('password') });
     if (error) return renderLogin(error.message === 'Invalid login credentials' ? 'Неверная почта или пароль.' : error.message);
+    USER = data.user;
     start();
   });
 }
@@ -464,7 +758,7 @@ async function start() {
   }
 }
 
-window.addEventListener('hashchange', () => { if (STATE) route(); });
+window.addEventListener('hashchange', () => { if (STATE) { route(); window.scrollTo(0, 0); } });
 
 (async () => {
   if (!configured) {
@@ -473,5 +767,5 @@ window.addEventListener('hashchange', () => { if (STATE) route(); });
     return;
   }
   const { data: { session } } = await sb.auth.getSession();
-  if (session) start(); else renderLogin();
+  if (session) { USER = session.user; start(); } else renderLogin();
 })();

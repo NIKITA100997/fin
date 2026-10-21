@@ -168,3 +168,22 @@ dialog form { display: flex; flex-direction: column; gap: 14px; }
   .next { animation: rise .35s ease-out; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
 }
+
+/* v2: деньги, операции, цели */
+select {
+  min-height: 46px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  padding: 0 12px; font-size: 16px; color: var(--ink); width: 100%;
+}
+.item-btn { width: 100%; background: none; border: none; border-top: 1px solid var(--line); text-align: left; cursor: pointer; color: inherit; font: inherit; }
+.item-btn:first-of-type { border-top: none; }
+.item-amt.pos { color: #1F7A4D; }
+.item-amt.muted { color: var(--muted); font-weight: 600; }
+.neg { color: var(--warn); }
+.kv3 { grid-template-columns: repeat(3, 1fr); margin-top: 0; }
+.kv3 b { font-size: 14px; white-space: nowrap; }
+button.goal { width: 100%; text-align: left; border: none; color: inherit; font: inherit; cursor: pointer; }
+details > summary { list-style: none; cursor: pointer; display: inline-flex; }
+details > summary::-webkit-details-marker { display: none; }
+nav.tabs > div { grid-template-columns: repeat(5, 1fr); }
+nav.tabs a { font-size: 10.5px; }
+@media (prefers-color-scheme: dark) { .item-amt.pos { color: #6FD3A0; } }
