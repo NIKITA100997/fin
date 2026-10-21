@@ -279,7 +279,8 @@ function txRows(list) {
       cls = 'muted';
     } else {
       title = t.merchant || cat || (t.amount < 0 ? 'Расход' : 'Доход');
-      sub = [cat && t.merchant ? cat : null, a ? accLabel(a) : null].filter(Boolean).join(', ');
+      sub = [cat && t.merchant ? cat : null, a ? accLabel(a) : null,
+        t.spread_parts ? `в бюджете ${t.spread_parts} ${plural(t.spread_parts, 'часть', 'части', 'частей')} ${t.spread_period === 'month' ? 'помесячно' : 'раз в 14 дней'}` : null].filter(Boolean).join(', ');
       amt = (t.amount > 0 ? '+' : '−') + E.rub(Math.abs(t.amount));
       cls = t.amount > 0 ? 'pos' : '';
     }
@@ -593,13 +594,37 @@ const nextYm = m => E.monthDay(`${m}-01`, 1, 1).slice(0, 7);
 const catName = id => RAW.categories.find(c => c.id === id)?.name ?? 'Без категории';
 const isExpense = t => t.amount < 0 && !t.link_id;
 
+/** Части покупки для бюджета: целиком в день покупки или N частей по графику. */
+function budgetParts(t) {
+  const d = t.occurred_at.slice(0, 10), total = -Number(t.amount);
+  if (!t.spread_parts) return [{ date: d, amount: total }];
+  const n = t.spread_parts, part = total / n;
+  return Array.from({ length: n }, (_, k) => ({
+    date: t.spread_period === 'month' ? E.monthDay(d, k, Number(d.slice(8))) : E.addDays(d, 14 * k),
+    amount: part,
+  }));
+}
+
 function spentBy(month) {
   const m = new Map();
-  for (const t of RAW.txs) if (isExpense(t) && ym(t.occurred_at) === month) {
+  for (const t of RAW.txs) if (isExpense(t)) for (const p of budgetParts(t)) if (ym(p.date) === month) {
     const k = t.category_id || 'none';
-    m.set(k, (m.get(k) ?? 0) - Number(t.amount));
+    m.set(k, (m.get(k) ?? 0) + p.amount);
   }
   return m;
+}
+
+/** Сколько бюджета будущих месяцев уже занято рассрочками. */
+function futureCommitted(count = 3) {
+  const out = [];
+  let m = ym(TODAY);
+  for (let i = 0; i < count; i++) {
+    m = nextYm(m);
+    const byCat = spentBy(m);
+    const total = [...byCat.values()].reduce((s, v) => s + v, 0);
+    if (total > 0.5) out.push({ month: m, total, byCat });
+  }
+  return out;
 }
 
 /** Состояние конвертов на текущий месяц: доступно, потрачено, остаток — с учётом переносов прошлых месяцев. */
@@ -628,8 +653,8 @@ function weekWant(bs) {
   const want = bs.filter(b => b.grp === 'want');
   const ids = new Set(want.map(b => b.category_id));
   const limit = want.reduce((s, b) => s + Number(b.limit_amount), 0) * 7 / days;
-  const spent = RAW.txs.filter(t => isExpense(t) && ids.has(t.category_id) && t.occurred_at.slice(0, 10) >= monday && t.occurred_at.slice(0, 10) <= TODAY)
-    .reduce((s, t) => s - Number(t.amount), 0);
+  const spent = RAW.txs.filter(t => isExpense(t) && ids.has(t.category_id))
+    .flatMap(budgetParts).filter(p => p.date >= monday && p.date <= TODAY).reduce((s, p) => s + p.amount, 0);
   return { limit, spent, left: limit - spent, ids };
 }
 
@@ -647,6 +672,8 @@ function budgetPanel() {
   const sp = spentBy(ym(TODAY));
   const unl = [...sp].filter(([k]) => !limited.has(k) && !eventCats.has(k));
   const daysLeft = E.diffDays(TODAY, E.monthDay(TODAY, 0, 31));
+  const fut = futureCommitted();
+  const nextBy = fut.find(f => f.month === nextYm(ym(TODAY)))?.byCat;
   return `
     <section class="panel">
       <div class="kv kv3">
@@ -656,6 +683,7 @@ function budgetPanel() {
       </div>
       ${wk.limit ? `<div class="item-note" style="margin-top:8px">Удовольствия на этой неделе: осталось <b class="${wk.left < 0 ? 'neg' : ''}">${wk.left < 0 ? '−' : ''}${E.rub(Math.abs(wk.left))}</b> из ${E.rub(wk.limit)}</div>` : ''}
       ${toLoan > 0 ? `<div class="item-note">Если месяц закончится сейчас, в досрочку: ${E.rub(toLoan)}</div>` : ''}
+      ${fut.length ? `<div class="item-note">Уже занято рассрочками: ${fut.map(f => `${E.monthName(f.month).split(' ')[0].toLowerCase()} ${E.rub(f.total)}`).join(', ')}</div>` : ''}
     </section>
     ${Object.entries(GROUPS).map(([g, title]) => {
       const list = bs.filter(b => b.grp === g);
@@ -667,7 +695,7 @@ function budgetPanel() {
           return `<div class="env">
             <button class="item item-btn" data-limit="${b.id}">
               <div class="item-main"><div class="item-title">${esc(b.name)}</div>
-                <div class="item-note">${E.rub(b.used)} из ${E.rub(b.avail)}${Math.abs(b.carried) > 0.5 ? ` (${b.carried > 0 ? '+' : '−'}${E.rub(Math.abs(b.carried))} с прошлых месяцев)` : ''}</div></div>
+                <div class="item-note">${E.rub(b.used)} из ${E.rub(b.avail)}${Math.abs(b.carried) > 0.5 ? ` (${b.carried > 0 ? '+' : '−'}${E.rub(Math.abs(b.carried))} с прошлых месяцев)` : ''}${nextBy?.get(b.category_id) ? `; в следующем месяце уже занято ${E.rub(nextBy.get(b.category_id))}` : ''}</div></div>
               <div class="item-amt ${over ? 'neg' : ''}">${over ? '−' : ''}${E.rub(Math.abs(b.rem))}</div>
             </button>
             <div class="meter ${over ? 'over' : p >= 80 ? 'warn' : ''}"><div style="width:${p}%"></div></div>
@@ -840,6 +868,12 @@ async function newTx(kind, tx, preset = {}) {
         value: editing ? RAW.categories.find(c => c.id === tx.category_id)?.name : preset.category ?? '' },
       { name: 'merchant', label: 'Комментарий', type: 'text', required: false, value: editing ? tx.merchant : '' },
       { name: 'date', label: 'Дата', type: 'date', value: editing ? tx.occurred_at.slice(0, 10) : TODAY },
+      ...(income ? [] : [
+        { name: 'parts', label: 'В бюджете', type: 'select', required: false, value: editing ? (tx.spread_parts ?? '') : '',
+          options: [{ value: '', label: 'Вся сумма сразу' }, ...[2, 3, 4, 6, 8, 12].map(n => ({ value: n, label: `Распределить на ${n} ${plural(n, 'часть', 'части', 'частей')}` }))] },
+        { name: 'period', label: 'Части', type: 'select', required: false, value: editing ? (tx.spread_period ?? '2w') : '2w',
+          options: [{ value: '2w', label: 'Раз в 14 дней (как Сплит)' }, { value: 'month', label: 'Раз в месяц' }] },
+      ]),
     ],
     actions: editing ? [{ value: 'delete', label: 'Удалить' }] : [],
   });
@@ -852,6 +886,7 @@ async function newTx(kind, tx, preset = {}) {
     account_id: v.account, occurred_at: `${v.date}T12:00:00Z`, amount: income ? a : -a,
     kind: income ? 'income' : 'purchase', merchant: v.merchant?.trim() || null, category_id: await categoryId(v.category),
   };
+  if (!income) { row.spread_parts = v.parts ? Number(v.parts) : null; row.spread_period = v.parts ? v.period : null; }
   if (editing) return mutate(sb.from('transactions').update(row).eq('id', tx.id));
   if (preset.recurring) row.recurring_income_id = preset.recurring;
   return mutate(sb.from('transactions').insert({ ...row, source: 'manual', dedup_hash: `manual:${uid()}` }), income ? 'Доход сохранён' : 'Расход сохранён');
@@ -1025,7 +1060,7 @@ async function editLimit(l) {
   const v = await form({
     title: isNew ? 'Категория бюджета' : catName(l.category_id),
     fields: [
-      ...(isNew ? [{ name: 'name', label: 'Категория', type: 'text', list: RAW.categories.map(c => c.name) }] : []),
+      { name: 'name', label: 'Категория', type: 'text', value: isNew ? '' : catName(l.category_id), list: isNew ? RAW.categories.map(c => c.name) : undefined },
       { name: 'limit', label: 'Лимит в месяц, ₽', value: l?.limit_amount ?? '' },
       { name: 'grp', label: 'Группа', type: 'select', value: l?.grp ?? 'need', options: Object.entries(GROUPS).map(([value, label]) => ({ value, label })) },
       { name: 'rollover', label: 'Остаток в конце месяца', type: 'select', value: l?.rollover ?? 'to_loan', options: Object.entries(ROLLOVER).map(([value, label]) => ({ value, label: cap(label) })) },
@@ -1040,6 +1075,13 @@ async function editLimit(l) {
     const category_id = await ensureCategory(v.name);
     if (!category_id) return;
     return mutate(sb.from('budget_limits').upsert({ ...row, owner_id: USER.id, category_id, sort: RAW.limits.length }, { onConflict: 'owner_id,category_id' }), 'Категория добавлена');
+  }
+  const newName = v.name.trim();
+  if (newName && newName !== catName(l.category_id)) {
+    if (RAW.categories.some(c => c.id !== l.category_id && c.name.toLowerCase() === newName.toLowerCase()))
+      return toast('Категория с таким названием уже есть');
+    const r = await sb.from('categories').update({ name: newName }).eq('id', l.category_id);
+    if (r.error) return toast(`Не сохранилось: ${r.error.message}`);
   }
   return mutate(sb.from('budget_limits').update(row).eq('id', l.id));
 }
