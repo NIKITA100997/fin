@@ -199,3 +199,6 @@ b.pos, .pos { color: #1F7A4D; }
 .meter.warn > div { background: #D08A1E; }
 .meter.over > div { background: var(--warn); }
 .item-note.neg, .neg { color: var(--warn); }
+.kv-btn { border: none; background: none; padding: 0; text-align: left; cursor: pointer; color: inherit; font: inherit; }
+.kv-btn span { display: block; font-size: 12px; color: var(--accent); }
+.kv-btn b { font-size: 14px; white-space: nowrap; }

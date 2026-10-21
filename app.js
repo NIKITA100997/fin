@@ -41,7 +41,7 @@ function toast(text) {
  * Модальная форма. Поля: { name, label, type: 'money'|'text'|'date'|'select', value, options, list, required }.
  * actions — дополнительные кнопки: [{ value, label }]; результат { $action: value }.
  */
-function form({ title, text, fields = [], submit = 'Сохранить', actions = [] }) {
+function form({ title, text, html, fields = [], submit = 'Сохранить', actions = [] }) {
   const input = f => {
     const req = f.required === false ? '' : 'required';
     if (f.type === 'select') return `<select name="${f.name}" ${req}>${f.options.map(o =>
@@ -55,6 +55,7 @@ function form({ title, text, fields = [], submit = 'Сохранить', actions
     <form method="dialog">
       <h2>${esc(title)}</h2>
       ${text ? `<p class="muted small" style="margin:0">${esc(text)}</p>` : ''}
+      ${html || ''}
       ${fields.map(f => `<label class="field">${esc(f.label)}${input(f)}</label>`).join('')}
       <div class="btns">
         ${submit ? `<button class="btn" value="ok">${esc(submit)}</button>` : ''}
@@ -97,10 +98,11 @@ async function load() {
     sb.from('budget_moves').select('*'),
     sb.from('planned_events').select('*').order('date'),
     sb.from('event_items').select('*').order('created_at'),
+    sb.from('budget_limit_changes').select('*').order('month'),
   ]);
   const err = all.find(r => r.error);
   if (err) throw err.error;
-  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems] = all.map(r => r.data);
+  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges] = all.map(r => r.data);
 
   const acc = new Map(accounts.map(a => [a.id, a]));
   const latest = new Map();
@@ -121,7 +123,7 @@ async function load() {
   }
   const bal = id => balance.get(id) ?? 0;
 
-  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems };
+  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges };
 
   STATE = {
     cards: terms.filter(t => acc.has(t.account_id)).map(t => {
@@ -636,13 +638,16 @@ function budgetState() {
   return RAW.limits.map(l => {
     const start = ym(l.created_at) < cur ? ym(l.created_at) : cur;
     let carry = 0, avail = 0, used = 0, rem = 0;
+    const hist = RAW.limitChanges.filter(c => c.category_id === l.category_id);
+    const limitFor = m => { const h = hist.filter(c => c.month <= m).pop(); return Number(h ? h.amount : l.limit_amount); };
     for (let m = start; m <= cur; m = nextYm(m)) {
-      avail = Number(l.limit_amount) + carry + moveSum(l.category_id, m, 'to_category') - moveSum(l.category_id, m, 'from_category');
+      avail = limitFor(m) + carry + moveSum(l.category_id, m, 'to_category') - moveSum(l.category_id, m, 'from_category');
       used = spent(m).get(l.category_id) ?? 0;
       rem = avail - used;
       carry = l.rollover === 'carry' ? rem : Math.min(0, rem);
     }
-    return { ...l, name: catName(l.category_id), avail, used, rem, carried: avail - Number(l.limit_amount) };
+    const curLimit = limitFor(cur);
+    return { ...l, limit_amount: curLimit, name: catName(l.category_id), avail, used, rem, carried: avail - curLimit - moveSum(l.category_id, cur, 'to_category') + moveSum(l.category_id, cur, 'from_category') };
   }).sort((a, b) => Object.keys(GROUPS).indexOf(a.grp) - Object.keys(GROUPS).indexOf(b.grp) || a.sort - b.sort);
 }
 
@@ -677,7 +682,7 @@ function budgetPanel() {
   return `
     <section class="panel">
       <div class="kv kv3">
-        <div><span>Лимит месяца</span><b>${E.rub(total)}</b></div>
+        <div><button class="kv-btn" data-total><span>Лимит, изменить</span><b>${E.rub(total)}</b></button></div>
         <div><span>Потрачено</span><b>${E.rub(used)}</b></div>
         <div><span>Осталось дней</span><b>${daysLeft}</b></div>
       </div>
@@ -1061,7 +1066,7 @@ async function editLimit(l) {
     title: isNew ? 'Категория бюджета' : catName(l.category_id),
     fields: [
       { name: 'name', label: 'Категория', type: 'text', value: isNew ? '' : catName(l.category_id), list: isNew ? RAW.categories.map(c => c.name) : undefined },
-      { name: 'limit', label: 'Лимит в месяц, ₽', value: l?.limit_amount ?? '' },
+      { name: 'limit', label: 'Лимит в месяц, ₽', value: l ? budgetState().find(b => b.id === l.id)?.limit_amount : '' },
       { name: 'grp', label: 'Группа', type: 'select', value: l?.grp ?? 'need', options: Object.entries(GROUPS).map(([value, label]) => ({ value, label })) },
       { name: 'rollover', label: 'Остаток в конце месяца', type: 'select', value: l?.rollover ?? 'to_loan', options: Object.entries(ROLLOVER).map(([value, label]) => ({ value, label: cap(label) })) },
     ],
@@ -1083,7 +1088,74 @@ async function editLimit(l) {
     const r = await sb.from('categories').update({ name: newName }).eq('id', l.category_id);
     if (r.error) return toast(`Не сохранилось: ${r.error.message}`);
   }
-  return mutate(sb.from('budget_limits').update(row).eq('id', l.id));
+  const cur = budgetState().find(b => b.id === l.id);
+  if (Math.abs(row.limit_amount - cur.limit_amount) > 0.5) {
+    const r2 = await sb.from('budget_limits').update({ grp: row.grp, rollover: row.rollover }).eq('id', l.id);
+    if (r2.error) return toast(`Не сохранилось: ${r2.error.message}`);
+    return setLimits([{ l: { ...l, limit_amount: cur.limit_amount }, amount: row.limit_amount }]);
+  }
+  return mutate(sb.from('budget_limits').update({ grp: row.grp, rollover: row.rollover }).eq('id', l.id));
+}
+
+/** Меняет лимиты с текущего месяца; прошлые месяцы сохраняют старые значения. */
+async function setLimits(changes) {
+  const cur = ym(TODAY);
+  const hist = [];
+  for (const { l, amount } of changes) {
+    const has = RAW.limitChanges.some(c => c.category_id === l.category_id);
+    const start = ym(l.created_at);
+    if (!has && start < cur) hist.push({ owner_id: USER.id, category_id: l.category_id, month: start, amount: Number(l.limit_amount) });
+    hist.push({ owner_id: USER.id, category_id: l.category_id, month: cur, amount });
+  }
+  const r1 = await sb.from('budget_limit_changes').upsert(hist, { onConflict: 'category_id,month' });
+  if (r1.error) return toast(`Не сохранилось: ${r1.error.message}`);
+  const res = await Promise.all(changes.map(({ l, amount }) => sb.from('budget_limits').update({ limit_amount: amount }).eq('id', l.id)));
+  const err = res.find(r => r.error);
+  return mutate(Promise.resolve(err || { error: null }), 'Лимиты обновлены');
+}
+
+function distribute(bs, newTotal, mode) {
+  const fixed = mode === 'keep_need' ? bs.filter(b => b.grp === 'need') : [];
+  const flex = bs.filter(b => !fixed.includes(b));
+  const target = newTotal - fixed.reduce((s, b) => s + b.limit_amount, 0);
+  if (target < 0 || !flex.length) return null;
+  const old = flex.reduce((s, b) => s + b.limit_amount, 0);
+  const res = flex.map(b => ({ b, amount: Math.max(0, Math.round((old ? b.limit_amount * target / old : target / flex.length) / 100) * 100) }));
+  const diff = target - res.reduce((s, r) => s + r.amount, 0);
+  res.sort((x, y) => y.amount - x.amount)[0].amount += diff;
+  return res;
+}
+
+async function editTotal() {
+  const bs = budgetState();
+  const total = bs.reduce((s, b) => s + b.limit_amount, 0);
+  const need = bs.filter(b => b.grp === 'need').reduce((s, b) => s + b.limit_amount, 0);
+  const v = await form({
+    title: 'Лимит месяца', text: `Сейчас ${E.rub(total)}, из них обязательное ${E.rub(need)}. Новый лимит действует с текущего месяца.`,
+    fields: [
+      { name: 'total', label: 'Новый лимит, ₽', value: total },
+      { name: 'mode', label: 'Как распределить', type: 'select', value: 'keep_need', options: [
+        { value: 'keep_need', label: 'Обязательное не трогать, остальное пропорционально' },
+        { value: 'all', label: 'Все категории пропорционально' }] },
+    ],
+    submit: 'Посчитать',
+  });
+  if (!v) return;
+  const nt = num(v.total);
+  if (!nt || nt <= 0) return toast('Укажите лимит');
+  const plan = distribute(bs, nt, v.mode);
+  if (!plan) return toast(`Обязательное (${E.rub(need)}) больше нового лимита: выберите «Все категории пропорционально»`);
+  const rows = plan.filter(p => Math.abs(p.amount - p.b.limit_amount) > 0.5).sort((x, y) => bs.indexOf(x.b) - bs.indexOf(y.b));
+  if (!rows.length) return toast('Лимиты не изменились');
+  const ok = await form({
+    title: `Новый лимит: ${E.rub(nt)}`,
+    html: `<div>${rows.map(p => `<div class="item"><div class="item-title">${esc(p.b.name)}</div>
+      <div class="item-amt"><span class="muted" style="font-weight:500">${E.rub(p.b.limit_amount)} →</span> ${E.rub(p.amount)}</div></div>`).join('')}</div>
+      <p class="muted small" style="margin:0">Суммы округлены до 100 ₽. Любую категорию можно потом поправить вручную.</p>`,
+    submit: 'Применить',
+  });
+  if (!ok || ok.$action) return;
+  return setLimits(rows.map(p => ({ l: p.b, amount: p.amount })));
 }
 
 /** Перенос между конвертами. Источники по умолчанию: удовольствия → для себя → резерв. */
@@ -1172,6 +1244,7 @@ $app.addEventListener('click', async e => {
   if (el.id === 'logout') { await sb.auth.signOut(); return renderLogin(); }
   if (d.seg) { sessionStorage.setItem('planSeg', d.seg); return route(); }
   if (d.budgetSetup !== undefined) return setupBudget();
+  if (d.total !== undefined) return editTotal();
   if (d.limit) return editLimit(RAW.limits.find(l => l.id === d.limit));
   if (d.newLimit !== undefined) return editLimit(null);
   if (d.cover) return moveMoney(d.cover);
