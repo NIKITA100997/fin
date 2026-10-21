@@ -355,23 +355,55 @@ function viewOverview() {
 }
 
 // ---------------------------------------------------------------- Деньги
+function accountRow(a) {
+  const b = RAW.bal(a.id);
+  const title = `${a.name}${a.last4 ? ` •${a.last4}` : ''}`;
+  if (a.kind in MONEY_KINDS) return `<button class="item item-btn" data-acc="${a.id}">
+      <div class="item-main"><div class="item-title">${esc(title)}</div>
+        <div class="item-note">${MONEY_KINDS[a.kind].toLowerCase()}; ${staleNote(a.id)}</div></div>
+      <div class="item-amt">${E.rub(b)}</div></button>`;
+  const limit = Number(a.credit_limit ?? 0);
+  const kind = { credit_card: 'кредитка', loan: 'кредит', installment: 'рассрочка' }[a.kind];
+  const data = a.kind === 'loan' ? `data-loan="${a.id}"` : a.kind === 'installment' ? `data-inst="${a.id}"` : `data-debt="${a.id}"`;
+  return `<button class="item item-btn" ${data}>
+      <div class="item-main"><div class="item-title">${esc(title)}</div>
+        <div class="item-note">${kind}${limit ? `, доступно ${E.rub(Math.max(0, limit - b))} из ${E.rub(limit)}` : ''}</div></div>
+      <div class="item-amt debt">${b > 0.5 ? '−' + E.rub(b) : E.rub(0)}</div></button>`;
+}
+
 function viewMoney() {
-  const accs = moneyAccounts();
   const mt = monthTotals(TODAY.slice(0, 7));
+  const ORDER = { debit: 0, savings: 1, brokerage: 2, cash: 3, credit_card: 4, installment: 5, loan: 6 };
+  const groups = new Map();
+  for (const a of [...RAW.accounts].sort((x, y) => ORDER[x.kind] - ORDER[y.kind])) {
+    const k = a.bank?.trim() || 'Без банка';
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(a);
+  }
+  const banks = [...groups].sort(([a], [b]) => (a === 'Без банка') - (b === 'Без банка') || a.localeCompare(b, 'ru'));
+  const creditAvail = RAW.accounts.filter(a => a.kind === 'credit_card' || a.kind === 'installment')
+    .reduce((s, a) => s + Math.max(0, Number(a.credit_limit ?? 0) - RAW.bal(a.id)), 0);
+
   return `
     <div class="top"><h1>Деньги</h1><button class="btn ghost small" data-new-acc>Новый счёт</button></div>
     <div class="stack">
       <section class="panel">
-        ${accs.map(a => `
-          <button class="item item-btn" data-acc="${a.id}">
-            <div class="item-main">
-              <div class="item-title">${esc(a.name)}</div>
-              <div class="item-note">${esc(a.bank ? `${a.bank}, ` : '')}${MONEY_KINDS[a.kind].toLowerCase()}; ${staleNote(a.id)}</div>
-            </div>
-            <div class="item-amt">${E.rub(RAW.bal(a.id))}</div>
-          </button>`).join('') || '<p class="muted small">Добавьте карты, наличные и накопления, чтобы видеть свои деньги и капитал.</p>'}
-        ${accs.length ? `<div class="total"><span>Всего</span><span>${E.rub(assetsTotal())}</span></div>` : ''}
+        <div class="kv kv3">
+          <div><span>Свои деньги</span><b>${E.rub(assetsTotal())}</b></div>
+          <div><span>Долги</span><b>${E.rub(debtsTotal())}</b></div>
+          <div><span>Доступно в кредит</span><b>${E.rub(creditAvail)}</b></div>
+        </div>
       </section>
+
+      ${banks.map(([bank, list]) => {
+        const own = list.filter(a => a.kind in MONEY_KINDS).reduce((s, a) => s + RAW.bal(a.id), 0);
+        const debt = list.filter(a => DEBT_KINDS.has(a.kind)).reduce((s, a) => s + RAW.bal(a.id), 0);
+        return `<section class="panel">
+          <div class="panel-head"><h2>${esc(bank)}</h2>
+            <span class="muted small">${[own ? E.rub(own) : '', debt ? `долг ${E.rub(debt)}` : ''].filter(Boolean).join(', ')}</span></div>
+          ${list.map(accountRow).join('')}
+        </section>`;
+      }).join('')}
 
       <section class="panel">
         <div class="panel-head"><h2>Регулярные доходы</h2><button class="btn link" data-new-income>Добавить</button></div>
@@ -650,7 +682,7 @@ async function editAccount(a) {
     text: isNew ? '' : 'Укажите остаток, как в приложении банка. Операции, внесённые после сверки, учитываются автоматически.',
     fields: [
       { name: 'name', label: 'Название', type: 'text', value: a?.name ?? '' },
-      { name: 'bank', label: 'Банк', type: 'text', required: false, value: a?.bank ?? '' },
+      { name: 'bank', label: 'Банк', type: 'text', required: false, value: a?.bank ?? '', list: [...new Set(RAW.accounts.map(x => x.bank).filter(Boolean))] },
       { name: 'kind', label: 'Тип', type: 'select', options: Object.entries(MONEY_KINDS).map(([value, label]) => ({ value, label })), value: a?.kind ?? 'debit' },
       { name: 'balance', label: 'Остаток сейчас, ₽', value: isNew ? '' : Math.round(RAW.bal(a.id) * 100) / 100 },
     ],
