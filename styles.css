@@ -190,3 +190,12 @@ nav.tabs a { font-size: 10.5px; }
 b.pos, .pos { color: #1F7A4D; }
 @media (prefers-color-scheme: dark) { b.pos, .pos { color: #6FD3A0; } }
 .item-amt.debt { color: var(--warn); }
+
+/* v5: бюджет и события */
+.seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; background: var(--surface-2); padding: 4px; border-radius: 14px; margin-bottom: 12px; }
+.seg button { border: none; background: none; min-height: 40px; border-radius: 10px; font-weight: 700; color: var(--muted); cursor: pointer; }
+.seg button[aria-selected=true] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.env .meter { margin-top: 0; }
+.meter.warn > div { background: #D08A1E; }
+.meter.over > div { background: var(--warn); }
+.item-note.neg, .neg { color: var(--warn); }

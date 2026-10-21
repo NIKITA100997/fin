@@ -93,10 +93,14 @@ async function load() {
     sb.from('goals').select('*').order('created_at'),
     sb.from('wishlist_items').select('*').is('bought_at', null).order('priority'),
     sb.from('recurring_incomes').select('*').eq('is_active', true).order('day_of_month'),
+    sb.from('budget_limits').select('*').order('sort'),
+    sb.from('budget_moves').select('*'),
+    sb.from('planned_events').select('*').order('date'),
+    sb.from('event_items').select('*').order('created_at'),
   ]);
   const err = all.find(r => r.error);
   if (err) throw err.error;
-  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes] = all.map(r => r.data);
+  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems] = all.map(r => r.data);
 
   const acc = new Map(accounts.map(a => [a.id, a]));
   const latest = new Map();
@@ -117,7 +121,7 @@ async function load() {
   }
   const bal = id => balance.get(id) ?? 0;
 
-  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes };
+  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems };
 
   STATE = {
     cards: terms.filter(t => acc.has(t.account_id)).map(t => {
@@ -217,11 +221,11 @@ const ICONS = {
   overview: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
   money: '<path d="M3 7h15a3 3 0 0 1 3 3v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 7l12-4v4"/><circle cx="16.5" cy="14" r="1.2"/>',
   debts: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
-  goals: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  plan: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
 };
-const TABS = [['overview', 'Обзор'], ['money', 'Деньги'], ['debts', 'Долги'], ['goals', 'Цели'], ['calendar', 'Календарь']];
-const ALIAS = { cards: 'debts', loan: 'debts' };
+const TABS = [['overview', 'Обзор'], ['money', 'Деньги'], ['debts', 'Долги'], ['plan', 'План'], ['calendar', 'Календарь']];
+const ALIAS = { cards: 'debts', loan: 'debts', goals: 'plan', budget: 'plan' };
 
 function renderTabs(current) {
   $tabs.hidden = false;
@@ -234,7 +238,7 @@ function renderTabs(current) {
 function route() {
   let id = (location.hash || '#overview').slice(1);
   id = ALIAS[id] || id;
-  const views = { overview: viewOverview, money: viewMoney, debts: viewDebts, goals: viewGoals, calendar: viewCalendar };
+  const views = { overview: viewOverview, money: viewMoney, debts: viewDebts, plan: viewPlan, calendar: viewCalendar };
   if (!views[id]) id = 'overview';
   renderTabs(id);
   $app.innerHTML = views[id]();
@@ -332,6 +336,13 @@ function viewOverview() {
           <button class="btn ghost small" data-new-tx="transfer">Перевод</button>
         </div>
       </section>
+
+      ${RAW.limits.length ? (() => { const bs = budgetState(); const wk = weekWant(bs); const total = bs.reduce((s, b) => s + Number(b.limit_amount), 0); const used = bs.reduce((s, b) => s + b.used, 0); const over = bs.filter(b => b.rem < 0);
+        return `<section class="panel"><div class="panel-head"><h2>Бюджет месяца</h2><a class="btn link" href="#plan">Подробнее</a></div>
+          <div class="row"><b>${E.rub(used)}</b><span class="muted small">из ${E.rub(total)}</span></div>
+          <div class="meter ${used > total ? 'over' : ''}"><div style="width:${Math.min(100, used / Math.max(1, total) * 100)}%"></div></div>
+          ${wk.limit ? `<div class="item-note">Удовольствия на неделе: осталось ${wk.left < 0 ? '−' : ''}${E.rub(Math.abs(wk.left))}</div>` : ''}
+          ${over.length ? `<div class="item-note neg">Перерасход: ${over.map(b => esc(b.name)).join(', ')}</div>` : ''}</section>`; })() : ''}
 
       <section class="panel">
         <div class="panel-head"><h2>Следующие 30 дней</h2><a class="btn link" href="#calendar">Весь календарь</a></div>
@@ -557,7 +568,7 @@ function viewGoals() {
     </button>`);
   const wishTotal = RAW.wishlist.reduce((s, w) => s + Number(w.price ?? 0), 0);
   return `
-    <div class="top"><h1>Цели</h1><button class="btn ghost small" data-new-goal>Новая цель</button></div>
+    <div class="btns" style="margin-top:0"><button class="btn small" data-new-goal>Новая цель</button></div>
     <div class="stack">
       ${goals.join('') || '<section class="panel"><p class="muted small" style="margin:0">Создайте цель: подушка безопасности, отпуск, досрочка по кредиту.</p></section>'}
       <section class="panel">
@@ -566,6 +577,177 @@ function viewGoals() {
         ${wish.length ? `<div class="total"><span>Всего</span><span>${E.rub(wishTotal)}</span></div>` : ''}
       </section>
     </div>`;
+}
+
+// ---------------------------------------------------------------- Бюджет
+const GROUPS = { need: 'Обязательное', want: 'Удовольствия', big: 'Крупное и нерегулярное' };
+const ROLLOVER = { to_loan: 'остаток — в досрочку', carry: 'остаток копится', none: 'остаток сгорает' };
+const BUDGET_TEMPLATE = [
+  ['Продукты и быт', 'need', 20000, 'to_loan'], ['Жильё и связь', 'need', 10000, 'to_loan'],
+  ['Транспорт', 'need', 7000, 'to_loan'], ['Кот', 'need', 3000, 'to_loan'], ['Здоровье', 'need', 2000, 'to_loan'],
+  ['Кафе, доставка, развлечения', 'want', 14000, 'none'],
+  ['Для себя', 'big', 7000, 'carry'], ['Резерв на нерегулярное', 'big', 7000, 'carry'],
+];
+const ym = d => d.slice(0, 7);
+const nextYm = m => E.monthDay(`${m}-01`, 1, 1).slice(0, 7);
+const catName = id => RAW.categories.find(c => c.id === id)?.name ?? 'Без категории';
+const isExpense = t => t.amount < 0 && !t.link_id;
+
+function spentBy(month) {
+  const m = new Map();
+  for (const t of RAW.txs) if (isExpense(t) && ym(t.occurred_at) === month) {
+    const k = t.category_id || 'none';
+    m.set(k, (m.get(k) ?? 0) - Number(t.amount));
+  }
+  return m;
+}
+
+/** Состояние конвертов на текущий месяц: доступно, потрачено, остаток — с учётом переносов прошлых месяцев. */
+function budgetState() {
+  const cur = ym(TODAY);
+  const spentCache = new Map();
+  const spent = m => { if (!spentCache.has(m)) spentCache.set(m, spentBy(m)); return spentCache.get(m); };
+  const moveSum = (cat, m, dir) => RAW.moves.filter(x => x.month === m && x[dir] === cat).reduce((s, x) => s + Number(x.amount), 0);
+  return RAW.limits.map(l => {
+    const start = ym(l.created_at) < cur ? ym(l.created_at) : cur;
+    let carry = 0, avail = 0, used = 0, rem = 0;
+    for (let m = start; m <= cur; m = nextYm(m)) {
+      avail = Number(l.limit_amount) + carry + moveSum(l.category_id, m, 'to_category') - moveSum(l.category_id, m, 'from_category');
+      used = spent(m).get(l.category_id) ?? 0;
+      rem = avail - used;
+      carry = l.rollover === 'carry' ? rem : Math.min(0, rem);
+    }
+    return { ...l, name: catName(l.category_id), avail, used, rem, carried: avail - Number(l.limit_amount) };
+  }).sort((a, b) => Object.keys(GROUPS).indexOf(a.grp) - Object.keys(GROUPS).indexOf(b.grp) || a.sort - b.sort);
+}
+
+function weekWant(bs) {
+  const wd = (E.parse(TODAY).getUTCDay() + 6) % 7;
+  const monday = E.addDays(TODAY, -wd);
+  const days = Number(E.monthDay(TODAY, 0, 31).slice(8));
+  const want = bs.filter(b => b.grp === 'want');
+  const ids = new Set(want.map(b => b.category_id));
+  const limit = want.reduce((s, b) => s + Number(b.limit_amount), 0) * 7 / days;
+  const spent = RAW.txs.filter(t => isExpense(t) && ids.has(t.category_id) && t.occurred_at.slice(0, 10) >= monday && t.occurred_at.slice(0, 10) <= TODAY)
+    .reduce((s, t) => s - Number(t.amount), 0);
+  return { limit, spent, left: limit - spent, ids };
+}
+
+function budgetPanel() {
+  if (!RAW.limits.length) return `<section class="panel"><h2>Бюджет не настроен</h2>
+    <p class="muted small">Создам категории и лимиты на 70 000 ₽: обязательное 42 000, удовольствия 14 000, крупное и нерегулярное 14 000. Всё можно поменять.</p>
+    <div class="btns"><button class="btn" data-budget-setup>Настроить бюджет</button></div></section>`;
+  const bs = budgetState();
+  const total = bs.reduce((s, b) => s + Number(b.limit_amount), 0);
+  const used = bs.reduce((s, b) => s + b.used, 0);
+  const wk = weekWant(bs);
+  const toLoan = bs.filter(b => b.rollover === 'to_loan' && b.rem > 0).reduce((s, b) => s + b.rem, 0);
+  const eventCats = new Set(RAW.events.map(e => e.category_id).filter(Boolean));
+  const limited = new Set(bs.map(b => b.category_id));
+  const sp = spentBy(ym(TODAY));
+  const unl = [...sp].filter(([k]) => !limited.has(k) && !eventCats.has(k));
+  const daysLeft = E.diffDays(TODAY, E.monthDay(TODAY, 0, 31));
+  return `
+    <section class="panel">
+      <div class="kv kv3">
+        <div><span>Лимит месяца</span><b>${E.rub(total)}</b></div>
+        <div><span>Потрачено</span><b>${E.rub(used)}</b></div>
+        <div><span>Осталось дней</span><b>${daysLeft}</b></div>
+      </div>
+      ${wk.limit ? `<div class="item-note" style="margin-top:8px">Удовольствия на этой неделе: осталось <b class="${wk.left < 0 ? 'neg' : ''}">${wk.left < 0 ? '−' : ''}${E.rub(Math.abs(wk.left))}</b> из ${E.rub(wk.limit)}</div>` : ''}
+      ${toLoan > 0 ? `<div class="item-note">Если месяц закончится сейчас, в досрочку: ${E.rub(toLoan)}</div>` : ''}
+    </section>
+    ${Object.entries(GROUPS).map(([g, title]) => {
+      const list = bs.filter(b => b.grp === g);
+      if (!list.length) return '';
+      return `<section class="panel"><h2>${title}</h2>
+        ${list.map(b => {
+          const p = b.avail > 0 ? Math.min(100, b.used / b.avail * 100) : 100;
+          const over = b.rem < 0;
+          return `<div class="env">
+            <button class="item item-btn" data-limit="${b.id}">
+              <div class="item-main"><div class="item-title">${esc(b.name)}</div>
+                <div class="item-note">${E.rub(b.used)} из ${E.rub(b.avail)}${Math.abs(b.carried) > 0.5 ? ` (${b.carried > 0 ? '+' : '−'}${E.rub(Math.abs(b.carried))} с прошлых месяцев)` : ''}</div></div>
+              <div class="item-amt ${over ? 'neg' : ''}">${over ? '−' : ''}${E.rub(Math.abs(b.rem))}</div>
+            </button>
+            <div class="meter ${over ? 'over' : p >= 80 ? 'warn' : ''}"><div style="width:${p}%"></div></div>
+            ${over ? `<button class="btn small" data-cover="${b.category_id}" style="margin-bottom:8px">Покрыть перерасход</button>` : ''}
+          </div>`;
+        }).join('')}
+      </section>`;
+    }).join('')}
+    ${unl.length ? `<section class="panel"><h2>Без лимита</h2>
+      ${unl.map(([k, v]) => `<div class="item"><div class="item-main"><div class="item-title">${esc(k === 'none' ? 'Без категории' : catName(k))}</div>
+        <div class="item-note">${k === 'none' ? 'проставьте категории в операциях' : 'добавьте лимит или перенесите траты в другую категорию'}</div></div>
+        <div class="item-amt">${E.rub(v)}</div></div>`).join('')}
+    </section>` : ''}
+    <div class="btns"><button class="btn ghost small" data-new-limit>Добавить категорию</button><button class="btn ghost small" data-move>Перенести между категориями</button></div>`;
+}
+
+// ---------------------------------------------------------------- События
+function eventInfo(e) {
+  const items = RAW.eventItems.filter(i => i.event_id === e.id);
+  const target = items.length ? items.reduce((s, i) => s + Number(i.budget ?? 0), 0) : Number(e.amount ?? 0);
+  const from = E.addDays(e.date, -75), to = E.addDays(e.date, 14);
+  const spent = e.category_id ? RAW.txs.filter(t => isExpense(t) && t.category_id === e.category_id && t.occurred_at.slice(0, 10) >= from && t.occurred_at.slice(0, 10) <= to)
+    .reduce((s, t) => s - Number(t.amount), 0) : 0;
+  return { items, target, spent };
+}
+
+function fundingPlan(e, target) {
+  const bs = RAW.limits.length ? budgetState() : [];
+  const months = Math.max(0, (Number(e.date.slice(0, 4)) - Number(TODAY.slice(0, 4))) * 12 + Number(e.date.slice(5, 7)) - Number(TODAY.slice(5, 7)));
+  const reserve = bs.filter(b => b.rollover === 'carry' && /резерв/i.test(b.name));
+  const resNow = reserve.reduce((s, b) => s + Math.max(0, b.rem), 0);
+  const resMonthly = reserve.reduce((s, b) => s + Number(b.limit_amount), 0);
+  const fromReserve = resNow + resMonthly * months;
+  const wantHalf = bs.filter(b => b.grp === 'want').reduce((s, b) => s + Number(b.limit_amount), 0) / 2;
+  const loan = STATE.loans[0];
+  const deferPrepay = 23520;
+  const deferCost = loan ? deferPrepay * E.loanRateAnnual(loan).rate / 12 : 0;
+  const rows = [
+    ['Резерв на нерегулярное к дате', fromReserve, 'бесплатно'],
+    ['Урезать удовольствия вдвое в месяц события', wantHalf, 'бесплатно'],
+    ['Отложить досрочку по кредиту на месяц', deferPrepay, `≈${E.rub(deferCost)} процентов`],
+  ];
+  let left = target;
+  const used = rows.map(([label, v, cost]) => { const take = Math.max(0, Math.min(v, left)); left -= take; return { label, take, cost }; }).filter(r => r.take > 0);
+  const sberDue = E.monthDay(e.date, 3, 31);
+  return { used, left, sberDue };
+}
+
+function eventsPanel() {
+  return `${RAW.events.filter(e => e.date >= E.addDays(TODAY, -14)).map(e => {
+    const { items, target, spent } = eventInfo(e);
+    const need = items.length ? items.filter(i => !i.bought).reduce((s, i) => s + Number(i.budget ?? 0), 0) : Math.max(0, target - spent);
+    const fp = fundingPlan(e, need);
+    const bought = items.filter(i => i.bought).length;
+    return `<section class="panel">
+      <div class="panel-head"><h2>${esc(e.name)}</h2><button class="btn link" data-event="${e.id}">Изменить</button></div>
+      <div class="row"><b>${E.rub(target)}</b><span class="muted small">${E.ru(e.date)} ${e.date.slice(0, 4)}, ${inDays(e.date)}</span></div>
+      ${spent ? `<div class="item-note">Уже потрачено ${E.rub(spent)} (категория «${esc(catName(e.category_id))}»)</div>` : ''}
+      ${items.length ? `<div style="margin-top:8px"><div class="small muted">Подарки: куплено ${bought} из ${items.length}</div>
+        ${items.map(i => `<button class="item item-btn" data-item="${i.id}">
+          <div class="item-main"><div class="item-title">${i.bought ? '✓ ' : ''}${esc(i.who)}</div></div>
+          <div class="item-amt ${i.bought ? 'muted' : ''}">${i.budget ? E.rub(i.budget) : ''}</div></button>`).join('')}</div>` : ''}
+      <div class="btns" style="margin-top:8px"><button class="btn ghost small" data-add-item="${e.id}">Добавить подарок</button></div>
+      ${need > 0 ? `<div style="margin-top:12px"><div class="small" style="font-weight:700">Осталось найти ${E.rub(need)}${items.length ? ' на некупленное' : ''}</div>
+        ${fp.used.map(r => `<div class="item"><div class="item-main"><div class="item-title">${esc(r.label)}</div><div class="item-note">${esc(r.cost)}</div></div><div class="item-amt">${E.rub(r.take)}</div></div>`).join('')}
+        ${fp.left > 0.5 ? `<div class="notice" style="margin-top:8px">Не хватает ${E.rub(fp.left)}: можно оплатить кредиткой Сбера в месяц события и погасить без процентов до ${E.ru(fp.sberDue)} ${fp.sberDue.slice(0, 4)}.</div>` : ''}
+      </div>` : ''}
+    </section>`;
+  }).join('') || '<section class="panel"><p class="muted small" style="margin:0">Новый год, дни рождения, отпуск: заведите событие заранее, и приложение посчитает, откуда взять деньги.</p></section>'}
+  <div class="btns"><button class="btn small" data-new-event>Новое событие</button></div>`;
+}
+
+function viewPlan() {
+  const seg = sessionStorage.getItem('planSeg') || 'budget';
+  const SEGS = [['budget', 'Бюджет'], ['events', 'События'], ['goals', 'Цели']];
+  const body = seg === 'events' ? eventsPanel() : seg === 'goals' ? viewGoals() : budgetPanel();
+  return `
+    <div class="top"><h1>План</h1></div>
+    <div class="seg" role="tablist">${SEGS.map(([id, label]) => `<button role="tab" aria-selected="${id === seg}" data-seg="${id}">${label}</button>`).join('')}</div>
+    <div class="stack">${body}</div>`;
 }
 
 // ---------------------------------------------------------------- Календарь
@@ -823,6 +1005,113 @@ async function exportMonth() {
   toast(`Выгружено операций: ${list.length}`);
 }
 
+async function ensureCategory(name) {
+  const id = await categoryId(name);
+  if (id && !RAW.categories.some(c => c.id === id)) RAW.categories.push({ id, name });
+  return id;
+}
+
+async function setupBudget() {
+  const rows = [];
+  for (const [i, [name, grp, limit, rollover]] of BUDGET_TEMPLATE.entries()) {
+    const category_id = await ensureCategory(name);
+    if (category_id) rows.push({ owner_id: USER.id, category_id, grp, limit_amount: limit, rollover, sort: i });
+  }
+  return mutate(sb.from('budget_limits').upsert(rows, { onConflict: 'owner_id,category_id' }), 'Бюджет настроен');
+}
+
+async function editLimit(l) {
+  const isNew = !l;
+  const v = await form({
+    title: isNew ? 'Категория бюджета' : catName(l.category_id),
+    fields: [
+      ...(isNew ? [{ name: 'name', label: 'Категория', type: 'text', list: RAW.categories.map(c => c.name) }] : []),
+      { name: 'limit', label: 'Лимит в месяц, ₽', value: l?.limit_amount ?? '' },
+      { name: 'grp', label: 'Группа', type: 'select', value: l?.grp ?? 'need', options: Object.entries(GROUPS).map(([value, label]) => ({ value, label })) },
+      { name: 'rollover', label: 'Остаток в конце месяца', type: 'select', value: l?.rollover ?? 'to_loan', options: Object.entries(ROLLOVER).map(([value, label]) => ({ value, label: cap(label) })) },
+    ],
+    actions: isNew ? [] : [{ value: 'delete', label: 'Убрать лимит' }],
+  });
+  if (!v) return;
+  if (v.$action === 'delete') return mutate(sb.from('budget_limits').delete().eq('id', l.id), 'Лимит убран');
+  const row = { limit_amount: num(v.limit), grp: v.grp, rollover: v.rollover };
+  if (!row.limit_amount) return toast('Укажите лимит');
+  if (isNew) {
+    const category_id = await ensureCategory(v.name);
+    if (!category_id) return;
+    return mutate(sb.from('budget_limits').upsert({ ...row, owner_id: USER.id, category_id, sort: RAW.limits.length }, { onConflict: 'owner_id,category_id' }), 'Категория добавлена');
+  }
+  return mutate(sb.from('budget_limits').update(row).eq('id', l.id));
+}
+
+/** Перенос между конвертами. Источники по умолчанию: удовольствия → для себя → резерв. */
+async function moveMoney(toCat) {
+  const bs = budgetState();
+  const target = toCat ? bs.find(b => b.category_id === toCat) : null;
+  const order = { want: 0, big: 1, need: 2 };
+  const sources = bs.filter(b => b.rem > 0.5 && b.category_id !== toCat)
+    .sort((a, b) => order[a.grp] - order[b.grp] || (/резерв/i.test(a.name) ? 1 : 0) - (/резерв/i.test(b.name) ? 1 : 0));
+  if (!sources.length) return toast('Нет категорий с остатком: перерасход перейдёт на следующий месяц');
+  const need = target ? -target.rem : '';
+  const v = await form({
+    title: target ? `Покрыть: ${target.name}` : 'Перенос между категориями',
+    text: target ? `Перерасход ${E.rub(-target.rem)}. Источники по порядку: удовольствия, для себя, резерв.` : '',
+    fields: [
+      { name: 'from', label: 'Откуда', type: 'select', value: sources[0].category_id,
+        options: sources.map(b => ({ value: b.category_id, label: `${b.name}: осталось ${E.rub(b.rem)}` })) },
+      ...(target ? [] : [{ name: 'to', label: 'Куда', type: 'select', options: bs.map(b => ({ value: b.category_id, label: b.name })) }]),
+      { name: 'amount', label: 'Сумма, ₽', value: need ? Math.ceil(Math.min(need, sources[0].rem)) : '' },
+    ],
+    submit: 'Перенести',
+  });
+  if (!v) return;
+  const to = target ? toCat : v.to;
+  if (v.from === to) return toast('Выберите разные категории');
+  return mutate(sb.from('budget_moves').insert({ owner_id: USER.id, month: ym(TODAY), from_category: v.from, to_category: to, amount: num(v.amount) }), 'Перенесено');
+}
+
+async function editEvent(e) {
+  const isNew = !e;
+  const v = await form({
+    title: isNew ? 'Плановое событие' : e.name,
+    text: 'Траты с категорией события не считаются перерасходом бюджета. Если добавить список подарков, сумма посчитается из него.',
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: e?.name ?? '' },
+      { name: 'date', label: 'Дата', type: 'date', value: e?.date ?? '' },
+      { name: 'amount', label: 'Общая сумма, ₽ (если без списка)', required: false, value: e?.amount ?? '' },
+      { name: 'yearly', label: 'Повторяется каждый год', type: 'select', value: String(e?.repeat_yearly ?? false), options: [{ value: 'false', label: 'Нет' }, { value: 'true', label: 'Да' }] },
+    ],
+    actions: isNew ? [] : [{ value: 'delete', label: 'Удалить событие' }],
+  });
+  if (!v) return;
+  if (v.$action === 'delete') return mutate(sb.from('planned_events').delete().eq('id', e.id), 'Событие удалено');
+  const row = { name: v.name.trim(), date: v.date, amount: num(v.amount), repeat_yearly: v.yearly === 'true' };
+  if (isNew) {
+    row.category_id = await ensureCategory(row.name);
+    sessionStorage.setItem('planSeg', 'events');
+    return mutate(sb.from('planned_events').insert({ ...row, owner_id: USER.id }), 'Событие создано');
+  }
+  return mutate(sb.from('planned_events').update(row).eq('id', e.id));
+}
+
+async function editItem(i, eventId) {
+  const isNew = !i;
+  const v = await form({
+    title: isNew ? 'Подарок' : i.who,
+    fields: [
+      { name: 'who', label: 'Кому или что', type: 'text', value: i?.who ?? '' },
+      { name: 'budget', label: 'Бюджет, ₽', required: false, value: i?.budget ?? '' },
+    ],
+    actions: isNew ? [] : [{ value: 'toggle', label: i.bought ? 'Не куплено' : 'Куплено' }, { value: 'delete', label: 'Удалить' }],
+  });
+  if (!v) return;
+  if (v.$action === 'toggle') return mutate(sb.from('event_items').update({ bought: !i.bought }).eq('id', i.id), i.bought ? 'Снята отметка' : 'Отмечено как купленное');
+  if (v.$action === 'delete') return mutate(sb.from('event_items').delete().eq('id', i.id), 'Удалено');
+  const row = { who: v.who.trim(), budget: num(v.budget) };
+  if (isNew) return mutate(sb.from('event_items').insert({ ...row, owner_id: USER.id, event_id: eventId }), 'Добавлено');
+  return mutate(sb.from('event_items').update(row).eq('id', i.id));
+}
+
 $app.addEventListener('input', e => {
   if (e.target.id !== 'prepay') return;
   const l = STATE.loans.find(x => x.id === e.target.dataset.loanId);
@@ -839,6 +1128,16 @@ $app.addEventListener('click', async e => {
   const d = el.dataset;
 
   if (el.id === 'logout') { await sb.auth.signOut(); return renderLogin(); }
+  if (d.seg) { sessionStorage.setItem('planSeg', d.seg); return route(); }
+  if (d.budgetSetup !== undefined) return setupBudget();
+  if (d.limit) return editLimit(RAW.limits.find(l => l.id === d.limit));
+  if (d.newLimit !== undefined) return editLimit(null);
+  if (d.cover) return moveMoney(d.cover);
+  if (d.move !== undefined) return moveMoney(null);
+  if (d.newEvent !== undefined) return editEvent(null);
+  if (d.event) return editEvent(RAW.events.find(e => e.id === d.event));
+  if (d.addItem) return editItem(null, d.addItem);
+  if (d.item) return editItem(RAW.eventItems.find(i => i.id === d.item));
   if (d.newTx) return newTx(d.newTx);
   if (d.newIncome !== undefined) return editIncome(null);
   if (d.income) return editIncome(RAW.incomes.find(i => i.id === d.income));
