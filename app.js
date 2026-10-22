@@ -1,5 +1,6 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import * as E from './engine.js';
+import { pdfLines, parseStatement, rowKind, BANK_CATEGORY_MAP } from './statement.js';
 
 const CFG = window.FIN_CONFIG || {};
 const configured = CFG.url && !CFG.url.includes('YOUR-PROJECT') && CFG.key && !CFG.key.includes('YOUR-');
@@ -99,10 +100,14 @@ async function load() {
     sb.from('planned_events').select('*').order('date'),
     sb.from('event_items').select('*').order('created_at'),
     sb.from('budget_limit_changes').select('*').order('month'),
+    sb.from('user_settings').select('*'),
+    sb.from('raw_notifications').select('*').eq('status', 'unparsed').order('received_at', { ascending: false }).limit(50),
+    sb.from('ingest_tokens').select('*').order('created_at', { ascending: false }),
+    sb.from('category_rules').select('*'),
   ]);
   const err = all.find(r => r.error);
   if (err) throw err.error;
-  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges] = all.map(r => r.data);
+  const [accounts, snaps, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges, settingsRows, unparsed, tokens, categoryRules] = all.map(r => r.data);
 
   const acc = new Map(accounts.map(a => [a.id, a]));
   const latest = new Map();
@@ -123,7 +128,7 @@ async function load() {
   }
   const bal = id => balance.get(id) ?? 0;
 
-  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges };
+  RAW = { accounts, acc, latest, bal, terms, buckets, loans, plans, txs, categories, goals, wishlist, incomes, limits, moves, events, eventItems, limitChanges, settings: settingsRows[0] ?? null, unparsed, tokens, categoryRules };
 
   STATE = {
     cards: terms.filter(t => acc.has(t.account_id)).map(t => {
@@ -205,7 +210,7 @@ function forecast() {
 const monthTotals = ym => {
   let inc = 0, exp = 0;
   for (const t of RAW.txs) {
-    if (t.link_id || t.occurred_at.slice(0, 7) !== ym) continue;
+    if (t.link_id || t.kind?.startsWith('transfer') || t.occurred_at.slice(0, 7) !== ym) continue;
     if (t.amount > 0) inc += Number(t.amount); else exp -= Number(t.amount);
   }
   return { inc, exp };
@@ -281,7 +286,8 @@ function txRows(list) {
       cls = 'muted';
     } else {
       title = t.merchant || cat || (t.amount < 0 ? 'Расход' : 'Доход');
-      sub = [cat && t.merchant ? cat : null, a ? accLabel(a) : null,
+      if (t.kind?.startsWith('transfer')) { title = `Перевод ${t.amount < 0 ? 'с' : 'на'} ${a ? accLabel(a) : ''}`; }
+      sub = [t.kind?.startsWith('transfer') ? 'без пары — нажмите, чтобы указать второй счёт' : null, cat && t.merchant ? cat : null, a ? accLabel(a) : null, t.source === 'push' ? 'из уведомления' : null,
         t.spread_parts ? `в бюджете ${t.spread_parts} ${plural(t.spread_parts, 'часть', 'части', 'частей')} ${t.spread_period === 'month' ? 'помесячно' : 'раз в 14 дней'}` : null].filter(Boolean).join(', ');
       amt = (t.amount > 0 ? '+' : '−') + E.rub(Math.abs(t.amount));
       cls = t.amount > 0 ? 'pos' : '';
@@ -311,7 +317,7 @@ function viewOverview() {
   const gap = fc && fc.min.value < 0 ? fc.min : null;
 
   return `
-    <div class="top"><h1>Обзор</h1><button class="icon-btn" id="logout">Выйти</button></div>
+    <div class="top"><h1>Обзор</h1><div><button class="icon-btn" data-settings>Настройки</button><button class="icon-btn" id="logout">Выйти</button></div></div>
     <div class="stack">
       ${next ? `
       <section class="next" aria-label="Ближайший платёж">
@@ -399,8 +405,14 @@ function viewMoney() {
     .reduce((s, a) => s + Math.max(0, Number(a.credit_limit ?? 0) - RAW.bal(a.id)), 0);
 
   return `
-    <div class="top"><h1>Деньги</h1><button class="btn ghost small" data-new-acc>Новый счёт</button></div>
+    <div class="top"><h1>Деньги</h1><div style="display:flex;gap:6px"><button class="btn ghost small" data-statement>Выписка</button><button class="btn ghost small" data-new-acc>Новый счёт</button></div></div>
     <div class="stack">
+      ${RAW.unparsed.length ? `<section class="panel"><div class="panel-head"><h2>Не распознано</h2><span class="badge warn">${RAW.unparsed.length}</span></div>
+        <p class="muted small" style="margin:0 0 4px">Уведомления с суммой, которые не удалось записать. Нажмите, чтобы записать вручную или скрыть.</p>
+        ${RAW.unparsed.slice(0, 10).map(r => `<button class="item item-btn" data-raw="${r.id}">
+          <div class="item-main"><div class="item-title">${esc(r.title || r.app)}</div>
+            <div class="item-note">${esc((r.body || '').slice(0, 120))}${r.reason ? ` — ${esc(r.reason)}` : ''}</div></div></button>`).join('')}
+      </section>` : ''}
       <section class="panel">
         <div class="kv kv3">
           <div><span>Свои деньги</span><b>${E.rub(assetsTotal())}</b></div>
@@ -594,7 +606,7 @@ const BUDGET_TEMPLATE = [
 const ym = d => d.slice(0, 7);
 const nextYm = m => E.monthDay(`${m}-01`, 1, 1).slice(0, 7);
 const catName = id => RAW.categories.find(c => c.id === id)?.name ?? 'Без категории';
-const isExpense = t => t.amount < 0 && !t.link_id;
+const isExpense = t => t.amount < 0 && !t.link_id && !t.kind?.startsWith('transfer');
 
 /** Части покупки для бюджета: целиком в день покупки или N частей по графику. */
 function budgetParts(t) {
@@ -907,6 +919,8 @@ async function newTx(kind, tx, preset = {}) {
     kind: income ? 'income' : 'purchase', merchant: v.merchant?.trim() || null, category_id: await categoryId(v.category),
   };
   if (!income) { row.spread_parts = v.parts ? Number(v.parts) : null; row.spread_period = v.parts ? v.period : null; }
+  if (editing && tx.source === 'push' && tx.merchant && row.category_id)
+    await sb.from('category_rules').upsert({ owner_id: USER.id, pattern: tx.merchant.toLowerCase(), category_id: row.category_id }, { onConflict: 'owner_id,pattern' });
   if (editing) return mutate(sb.from('transactions').update(row).eq('id', tx.id));
   if (preset.recurring) row.recurring_income_id = preset.recurring;
   return mutate(sb.from('transactions').insert({ ...row, source: 'manual', dedup_hash: `manual:${uid()}` }), income ? 'Доход сохранён' : 'Расход сохранён');
@@ -922,17 +936,19 @@ async function editAccount(a) {
       { name: 'bank', label: 'Банк', type: 'text', required: false, value: a?.bank ?? '', list: [...new Set(RAW.accounts.map(x => x.bank).filter(Boolean))] },
       { name: 'kind', label: 'Тип', type: 'select', options: Object.entries(MONEY_KINDS).map(([value, label]) => ({ value, label })), value: a?.kind ?? 'debit' },
       { name: 'balance', label: 'Остаток сейчас, ₽', value: isNew ? '' : Math.round(RAW.bal(a.id) * 100) / 100 },
+      { name: 'last4', label: 'Последние 4 цифры карты', type: 'text', required: false, value: a?.last4 ?? '' },
+      { name: 'aliases', label: 'Другие номера (виртуальный в Mir Pay, номер счёта), через запятую', type: 'text', required: false, value: (a?.card_aliases ?? []).join(', ') },
     ],
     actions: isNew ? [] : [{ value: 'hide', label: 'Скрыть счёт' }],
   });
   if (!v) return;
   if (v.$action === 'hide') return mutate(sb.from('accounts').update({ is_archived: true }).eq('id', a.id), 'Счёт скрыт');
   if (isNew) {
-    const { data, error } = await sb.from('accounts').insert({ owner_id: USER.id, name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind }).select().single();
+    const { data, error } = await sb.from('accounts').insert({ owner_id: USER.id, name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind, ...idsRow(v) }).select().single();
     if (error) return toast(`Не сохранилось: ${error.message}`);
     return mutate(sb.from('balance_snapshots').insert({ account_id: data.id, balance: num(v.balance) ?? 0, source: 'manual' }), 'Счёт добавлен');
   }
-  const r = await sb.from('accounts').update({ name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind }).eq('id', a.id);
+  const r = await sb.from('accounts').update({ name: v.name.trim(), bank: v.bank.trim() || '', kind: v.kind, ...idsRow(v) }).eq('id', a.id);
   if (r.error) return toast(`Не сохранилось: ${r.error.message}`);
   const b = num(v.balance);
   if (b != null && Math.abs(b - RAW.bal(a.id)) > 0.004) return mutate(sb.from('balance_snapshots').insert({ account_id: a.id, balance: b, source: 'manual' }));
@@ -1241,6 +1257,213 @@ async function editItem(i, eventId) {
   return mutate(sb.from('event_items').update(row).eq('id', i.id));
 }
 
+const idsRow = v => ({
+  last4: (v.last4 || '').replace(/\D/g, '').slice(-4) || null,
+  card_aliases: String(v.aliases || '').split(/[,\s]+/).map(x => x.replace(/\D/g, '').slice(-4)).filter(x => x.length === 4),
+});
+
+async function editIds(a) {
+  const v = await form({
+    title: `${accLabel(a)}: номера`, text: 'По этим номерам уведомления банков и Mir Pay привязываются к счёту.',
+    fields: [
+      { name: 'last4', label: 'Последние 4 цифры карты', type: 'text', required: false, value: a.last4 ?? '' },
+      { name: 'aliases', label: 'Другие номера через запятую (виртуальный в Mir Pay и т. п.)', type: 'text', required: false, value: (a.card_aliases ?? []).join(', ') },
+      { name: 'push', label: 'Число в уведомлении после суммы — это', type: 'select', value: a.push_number ?? 'auto', options: [
+        { value: 'auto', label: 'Определять автоматически' }, { value: 'available', label: 'Доступный кредитный лимит' },
+        { value: 'spend_limit', label: 'Остаток моего лимита трат' }, { value: 'balance', label: 'Остаток на счёте' }, { value: 'none', label: 'Не использовать' }] },
+    ],
+  });
+  if (!v) return;
+  return mutate(sb.from('accounts').update({ ...idsRow(v), push_number: v.push }).eq('id', a.id));
+}
+
+async function editSettings() {
+  const names = (RAW.settings?.own_names ?? []).join(', ');
+  const token = RAW.tokens[0]?.token;
+  const url = `${CFG.url}/functions/v1/ingest`;
+  const v = await form({
+    title: 'Настройки',
+    html: `<div class="small" style="display:flex;flex-direction:column;gap:6px">
+      <b>Приём уведомлений</b>
+      <div class="muted">Адрес для MacroDroid:</div><code class="code">${esc(url)}</code>
+      <div class="muted">Ключ:</div><code class="code">${token ? esc(token) : 'ещё не создан'}</code>
+      <div class="muted">Ключ даёт право только добавлять уведомления. Никому его не отправляйте; если он утёк, создайте новый.</div></div>`,
+    fields: [{ name: 'names', label: 'Мои имена в уведомлениях банков, через запятую', type: 'text', required: false, value: names }],
+    actions: [{ value: 'token', label: token ? 'Новый ключ' : 'Создать ключ' }],
+  });
+  if (!v) return;
+  if (v.$action === 'token') {
+    const bytes = crypto.getRandomValues(new Uint8Array(24));
+    const t = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    await sb.from('ingest_tokens').delete().eq('owner_id', USER.id);
+    const ok = await mutate(sb.from('ingest_tokens').insert({ owner_id: USER.id, token: t }), 'Ключ создан');
+    if (ok) editSettings();
+    return;
+  }
+  const own_names = String(v.names || '').split(',').map(x => x.trim()).filter(Boolean);
+  return mutate(sb.from('user_settings').upsert({ owner_id: USER.id, own_names, updated_at: new Date().toISOString() }, { onConflict: 'owner_id' }));
+}
+
+async function handleRaw(r) {
+  const v = await form({
+    title: r.title || r.app, text: `${r.app}: ${r.body}`, submit: '',
+    actions: [{ value: 'expense', label: 'Записать расход' }, { value: 'income', label: 'Записать доход' }, { value: 'ignore', label: 'Скрыть' }],
+  });
+  if (!v) return;
+  await sb.from('raw_notifications').update({ status: 'ignored' }).eq('id', r.id);
+  if (v.$action === 'ignore') { await load(); route(); return toast('Скрыто'); }
+  const m = `${r.title} ${r.body}`.match(/(\d[\d\s\u00a0]*(?:[.,]\d{1,2})?)\s*(?:₽|RUB)/);
+  return newTx(v.$action, null, { amount: m ? num(m[1]) : '' });
+}
+
+async function pairTransfer(t) {
+  const a = RAW.acc.get(t.account_id);
+  const v = await form({
+    title: 'Перевод без пары', text: `${E.rub(Math.abs(t.amount))} ${t.amount < 0 ? 'со счёта' : 'на счёт'} «${a ? accLabel(a) : '?'}». Укажите второй счёт или поменяйте тип операции.`,
+    fields: [{ name: 'other', label: t.amount < 0 ? 'Куда' : 'Откуда', type: 'select', options: accountOptions(x => x.id !== t.account_id) }],
+    submit: 'Связать', actions: [{ value: t.amount < 0 ? 'purchase' : 'income', label: t.amount < 0 ? 'Это покупка' : 'Это доход' }, { value: 'delete', label: 'Удалить' }],
+  });
+  if (!v) return;
+  if (v.$action === 'delete') return mutate(sb.from('transactions').delete().eq('id', t.id), 'Удалено');
+  if (v.$action) return mutate(sb.from('transactions').update({ kind: v.$action }).eq('id', t.id), 'Тип изменён');
+  const link = uid();
+  const r1 = await sb.from('transactions').update({ link_id: link }).eq('id', t.id);
+  if (r1.error) return toast(`Не сохранилось: ${r1.error.message}`);
+  return mutate(sb.from('transactions').insert({
+    account_id: v.other, occurred_at: t.occurred_at, amount: -Number(t.amount), kind: t.amount < 0 ? 'transfer_in' : 'transfer_out',
+    source: 'manual', dedup_hash: `manual:${uid()}`, link_id: link,
+  }), 'Перевод связан');
+}
+
+// ---------------------------------------------------------------- Сверка с выпиской
+function pickFile(accept) {
+  return new Promise(resolve => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = accept;
+    inp.onchange = () => resolve(inp.files[0] || null);
+    inp.click();
+  });
+}
+
+const findByCard = c => RAW.accounts.find(a => c && (a.last4 === c || (a.card_aliases ?? []).includes(c)));
+const effect = (a, amount) => DEBT_KINDS.has(a.kind) ? -Number(amount) : Number(amount);
+
+/** Значение счёта в приложении на конец дня `date`: текущее минус всё, что было позже. */
+function valueAt(a, date) {
+  return RAW.bal(a.id) - RAW.txs.filter(t => t.account_id === a.id && t.occurred_at.slice(0, 10) > date)
+    .reduce((s, t) => s + effect(a, t.amount), 0);
+}
+
+function reconcile(st, a) {
+  const txs = RAW.txs.filter(t => t.account_id === a.id);
+  const used = new Set();
+  const missing = [];
+  for (const r of st.rows) {
+    const hit = txs.find(t => !used.has(t.id) && Math.abs(Number(t.amount) - r.amount) < 0.01
+      && Math.abs(E.diffDays(t.occurred_at.slice(0, 10), r.date)) <= 2);
+    if (hit) used.add(hit.id); else missing.push(r);
+  }
+  const extra = txs.filter(t => !used.has(t.id) && t.source !== 'statement'
+    && t.occurred_at.slice(0, 10) >= st.from && t.occurred_at.slice(0, 10) <= st.to);
+  return { matched: used.size, missing, extra };
+}
+
+function statementValue(st, a) {
+  if (!st.closing) return null;
+  if (st.closing.kind === 'available') return a.credit_limit != null ? Number(a.credit_limit) - st.closing.value : null;
+  return st.closing.value;
+}
+
+async function importStatement() {
+  const file = await pickFile('application/pdf');
+  if (!file) return;
+  toast('Читаю выписку…');
+  let st;
+  try { st = parseStatement(await pdfLines(file)); }
+  catch (e) { return toast(`Не удалось прочитать PDF: ${e.message}`); }
+  if (!st || !st.rows.length) return toast('Не узнал формат выписки: пока поддерживаются Сбер и Т-Банк');
+
+  let a = findByCard(st.last4) || st.rows.map(r => findByCard(r.card)).find(Boolean);
+  if (!a) {
+    const v = await form({ title: 'Чья это выписка?', text: `${st.bank}, ${st.rows.length} операций. Номер карты не найден среди ваших счетов.`,
+      fields: [{ name: 'acc', label: 'Счёт', type: 'select', options: accountOptions(x => x.kind !== 'loan') }], submit: 'Дальше' });
+    if (!v || v.$action) return;
+    a = RAW.acc.get(v.acc);
+  }
+  const newCards = [...new Set(st.rows.map(r => r.card).filter(c => c && !findByCard(c)))];
+  if (newCards.length) await sb.from('accounts').update({ card_aliases: [...(a.card_aliases ?? []), ...newCards] }).eq('id', a.id);
+
+  const { matched, missing, extra } = reconcile(st, a);
+  const sumOf = list => list.reduce((s, r) => s + Math.abs(Number(r.amount)), 0);
+  const row = (date, title, amount) => `<div class="item"><div class="item-left"><div class="date-col">${E.ru(date)}</div>
+    <div class="item-main"><div class="item-title">${esc(title)}</div></div></div><div class="item-amt">${amount > 0 ? '+' : '−'}${E.rub(Math.abs(amount))}</div></div>`;
+  const v = await form({
+    title: `Выписка: ${accLabel(a)}`,
+    html: `<div class="small">
+      <p class="muted" style="margin:0 0 8px">${E.ru(st.from)} — ${E.ru(st.to)} ${st.to.slice(0, 4)}. Операций в выписке: ${st.rows.length}, совпало с приложением: ${matched}.</p>
+      ${missing.length ? `<b>Нет в приложении: ${missing.length} на ${E.rub(sumOf(missing))}</b>
+        ${missing.slice(0, 8).map(r => row(r.date, r.merchant || r.desc, r.amount)).join('')}
+        ${missing.length > 8 ? `<p class="muted">и ещё ${missing.length - 8}</p>` : ''}` : '<b>Все операции выписки уже есть в приложении.</b>'}
+      ${extra.length ? `<div style="margin-top:8px"><b>Есть в приложении, нет в выписке: ${extra.length}</b>
+        <p class="muted" style="margin:2px 0">Проверьте: это могут быть ошибки ввода или операции, которые банк ещё не провёл.</p>
+        ${extra.slice(0, 5).map(t => row(t.occurred_at.slice(0, 10), t.merchant || 'Операция', Number(t.amount))).join('')}</div>` : ''}
+      ${newCards.length ? `<p class="muted">Новые номера карты ${newCards.join(', ')} привязаны к этому счёту.</p>` : ''}
+    </div>`,
+    submit: missing.length ? `Добавить ${missing.length} и сверить остаток` : 'Сверить остаток',
+  });
+  if (!v || v.$action) return;
+
+  if (missing.length) {
+    const own = RAW.settings?.own_names ?? [];
+    // Внутренние переводы на договор: договор — это ваш счёт в том же банке. Спрашиваем один раз и запоминаем.
+    const contractAcc = new Map();
+    for (const c of [...new Set(missing.map(r => r.contract).filter(Boolean))]) {
+      let target = RAW.accounts.find(x => (x.card_aliases ?? []).includes(c));
+      if (!target) {
+        const guess = RAW.accounts.find(x => x.bank === a.bank && x.kind === 'debit' && x.id !== a.id);
+        const q = await form({ title: `Договор ${c}`, text: 'В выписке есть переводы на этот договор. Какой это ваш счёт?',
+          fields: [{ name: 'acc', label: 'Счёт', type: 'select', value: guess?.id, options: accountOptions(x => x.id !== a.id) }], submit: 'Запомнить' });
+        if (!q || q.$action) continue;
+        target = RAW.acc.get(q.acc);
+        await sb.from('accounts').update({ card_aliases: [...(target.card_aliases ?? []), c] }).eq('id', target.id);
+      }
+      contractAcc.set(c, target);
+    }
+    const rules = new Map(RAW.categoryRules.map(r => [r.pattern, r.category_id]));
+    const catByName = n => RAW.categories.find(c => c.name.toLowerCase() === (n || '').toLowerCase())?.id ?? null;
+    const rows = [];
+    missing.forEach((r, i) => {
+      const k = rowKind(r, own);
+      // created_at = время операции: исторические операции уже учтены в прежних сверках остатка
+      const base = { account_id: a.id, occurred_at: `${r.date}T${r.time}:00+03:00`, created_at: `${r.date}T${r.time}:00+03:00`, amount: r.amount, merchant: r.merchant || r.desc,
+        source: 'statement', raw_text: r.desc, dedup_hash: `stmt:${r.date}:${r.time}:${r.amount}:${i}` };
+      const to = k === 'transfer_out_contract' ? contractAcc.get(r.contract) : null;
+      if (to) {
+        const link = uid();
+        rows.push({ ...base, kind: 'transfer_out', link_id: link, merchant: null });
+        rows.push({ ...base, account_id: to.id, amount: -r.amount, kind: 'transfer_in', link_id: link, merchant: null, dedup_hash: `${base.dedup_hash}:pair` });
+      } else if (k === 'transfer_out_contract') rows.push({ ...base, kind: 'transfer_out' });
+      else rows.push({ ...base, kind: k, category_id: k === 'purchase' ? (rules.get((r.merchant || '').toLowerCase()) ?? catByName(BANK_CATEGORY_MAP[r.category])) : null });
+    });
+    const { error } = await sb.from('transactions').insert(rows);
+    if (error) return toast(`Не сохранилось: ${error.message}`);
+  }
+  await load();
+  const target = statementValue(st, a);
+  if (target != null) {
+    const acc = RAW.acc.get(a.id);
+    const appAt = valueAt(acc, st.closing.date);
+    const diff = target - appAt;
+    if (Math.abs(diff) >= 0.01) {
+      const label = DEBT_KINDS.has(acc.kind) ? 'Долг' : 'Остаток';
+      const ok = await form({ title: 'Сверка остатка', submit: 'Исправить по выписке',
+        text: `${label} на ${E.ru(st.closing.date)}: по выписке ${E.rub(target)}, в приложении ${E.rub(appAt)}. Разница ${diff > 0 ? '+' : '−'}${E.rub(Math.abs(diff))}.` });
+      if (ok && !ok.$action) return mutate(sb.from('balance_snapshots').insert({ account_id: acc.id, balance: RAW.bal(acc.id) + diff, source: 'statement' }), 'Остаток сверен');
+    } else toast('Остаток сходится с выпиской до копейки');
+  }
+  route();
+}
+
 $app.addEventListener('input', e => {
   if (e.target.id !== 'prepay') return;
   const l = STATE.loans.find(x => x.id === e.target.dataset.loanId);
@@ -1283,8 +1506,12 @@ $app.addEventListener('click', async e => {
       if (v?.$action === 'delete') return mutate(sb.from('transactions').delete().eq('link_id', t.link_id), 'Удалено');
       return;
     }
+    if (t.kind?.startsWith('transfer')) return pairTransfer(t);
     return newTx(t.amount > 0 ? 'income' : 'expense', t);
   }
+  if (d.settings !== undefined) return editSettings();
+  if (d.statement !== undefined) return importStatement();
+  if (d.raw) return handleRaw(RAW.unparsed.find(r => r.id === d.raw));
   if (d.newAcc !== undefined) return editAccount(null);
   if (d.acc) return editAccount(RAW.acc.get(d.acc));
   if (d.newGoal !== undefined) { const g = await editGoal(null); if (g) { await load(); route(); toast('Цель создана'); } return; }
@@ -1293,8 +1520,10 @@ $app.addEventListener('click', async e => {
   if (d.wish) return editWish(RAW.wishlist.find(w => w.id === d.wish));
 
   if (d.debt) {
-    const v = await form({ title: 'Текущий долг', text: 'Сумма долга из приложения банка.', fields: [{ name: 'debt', label: 'Долг, ₽', value: Math.round(RAW.bal(d.debt) * 100) / 100 }] });
-    if (v && num(v.debt) != null) mutate(sb.from('balance_snapshots').insert({ account_id: d.debt, balance: num(v.debt), source: 'manual' }));
+    const v = await form({ title: 'Текущий долг', text: 'Сумма долга из приложения банка.', fields: [{ name: 'debt', label: 'Долг, ₽', value: Math.round(RAW.bal(d.debt) * 100) / 100 }],
+      actions: [{ value: 'ids', label: 'Номера карты' }] });
+    if (v?.$action === 'ids') return editIds(RAW.acc.get(d.debt));
+    if (v && !v.$action && num(v.debt) != null) mutate(sb.from('balance_snapshots').insert({ account_id: d.debt, balance: num(v.debt), source: 'manual' }));
   }
 
   if (d.addBucket) {
